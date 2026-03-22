@@ -120,6 +120,41 @@ Extract intent. Return ONLY valid JSON:
 
     console.log('✅ [AI] Intent:', JSON.stringify(intent));
 
+    // Execute Actions (e.g. Google Calendar)
+    const { googleAccessToken } = req.body;
+    let actionResult = null;
+
+    if (intent.action === 'create_event' && intent.date && intent.time && googleAccessToken) {
+      console.log('📅 [Action] Scheduling Google Meet event...');
+      try {
+        const startTime = new Date(`${intent.date}T${intent.time}:00`);
+        const endTime = new Date(startTime.getTime() + 60 * 60 * 1000); // Default 1 hour duration
+        
+        const eventBody = {
+          summary: intent.title,
+          description: intent.notes || 'Created by AI Assistant',
+          start: { dateTime: startTime.toISOString(), timeZone: 'UTC' },
+          end: { dateTime: endTime.toISOString(), timeZone: 'UTC' },
+          conferenceData: {
+            createRequest: { requestId: `meet-${Date.now()}`, conferenceSolutionKey: { type: "hangoutsMeet" } } // Auto create Meet link
+          }
+        };
+
+        const calRes = await axios.post(
+          'https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1',
+          eventBody,
+          { headers: { Authorization: `Bearer ${googleAccessToken}` } }
+        );
+
+        console.log('✅ [Action] Event Created:', calRes.data.htmlLink);
+        actionResult = 'Event Scheduled Successfully';
+        intent.meetLink = calRes.data.hangoutLink;
+      } catch (calError) {
+        console.error('❌ [Action] Google Calendar Error:', calError.response?.data || calError.message);
+        actionResult = 'Failed to Schedule Event';
+      }
+    }
+
     // Auto-save to Supabase if we have a userId
     if (userId) {
       console.log('💾 [DB] Saving to Supabase for user:', userId);
@@ -131,7 +166,7 @@ Extract intent. Return ONLY valid JSON:
         date: intent.date,
         time: intent.time,
         notes: intent.notes,
-        status: 'done',
+        status: actionResult === 'Failed to Schedule Event' ? 'error' : 'done',
       });
     }
 
