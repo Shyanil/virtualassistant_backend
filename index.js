@@ -178,6 +178,70 @@ Extract intent. Return ONLY valid JSON:
 });
 
 
+const multer = require('multer');
+const upload = multer({ 
+  storage: multer.memoryStorage(), 
+  limits: { fileSize: 50 * 1024 * 1024 } // 50 MB limit
+});
+
+/**
+ * 📄 Analyze Document (Gemini 2.5 Pro Vision)
+ * Receives: multipart/form-data with 'document' file and 'userId'
+ */
+app.post('/api/analyze-document', upload.single('document'), async (req, res) => {
+  try {
+    const file = req.file;
+    const { userId } = req.body;
+
+    if (!file) return res.status(400).json({ error: 'No document uploaded' });
+
+    console.log(`📄 [Document] Analyzing ${file.originalname} (${file.mimetype}) ...`);
+    const mimeType = file.mimetype;
+    const base64Data = file.buffer.toString('base64');
+
+    const prompt = `Please analyze this document. 
+If it is a receipt or invoice, extract the total amount, date, and items.
+If it is an article, letter, or notes, provide a clear, structured summary.
+Format your output in clean Markdown.`;
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ 
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType: mimeType, data: base64Data } }
+          ] 
+        }],
+        generationConfig: { temperature: 0.1 },
+      }
+    );
+
+    const extractedText = response.data.candidates?.[0]?.content?.parts?.[0]?.text || 'No text extracted.';
+    console.log(`✅ [Document] Analysis Complete`);
+
+    // Auto-save to Supabase if we have a userId
+    if (userId) {
+      console.log('💾 [DB] Saving Document Log to Supabase for user:', userId);
+      await supabase.from('voice_logs').insert({
+        user_id: userId,
+        transcript: 'Uploaded Document: ' + file.originalname,
+        action: 'document_analysis',
+        title: 'Document Analysis',
+        notes: extractedText,
+        status: 'done',
+      });
+    }
+
+    res.json({ text: extractedText });
+
+  } catch (error) {
+    console.error('❌ [Document] Analysis Error:', error.response?.data?.error?.message || error.message);
+    res.status(500).json({ error: 'Document analysis failed' });
+  }
+});
+
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 AI Backend running at http://0.0.0.0:${PORT}`);
 });
