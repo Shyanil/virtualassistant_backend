@@ -15,8 +15,11 @@ app.use(morgan('dev'));
 
 // ─── API Key Auth Middleware ─────────────────────────────────
 const validateApiKey = (req, res, next) => {
+  const configuredKey = process.env.BACKEND_API_KEY;
+  // Only enforce if the key is configured (skip check in dev when key not set)
+  if (!configuredKey) return next();
   const apiKey = req.headers['x-api-key'];
-  if (!apiKey || apiKey !== process.env.BACKEND_API_KEY) {
+  if (!apiKey || apiKey !== configuredKey) {
     return res.status(401).json({ error: 'Unauthorized: Invalid or missing API key.' });
   }
   next();
