@@ -208,10 +208,24 @@ app.post('/api/analyze-document', validateApiKey, upload.single('document'), asy
     const mimeType = file.mimetype;
     const base64Data = file.buffer.toString('base64');
 
-    const prompt = `Please analyze this document. 
-If it is a receipt or invoice, extract the total amount, date, and items.
-If it is an article, letter, or notes, provide a clear, structured summary.
-Format your output in clean Markdown.`;
+    const prompt = `Analyze this document carefully.
+
+First, extract any important dates, deadlines, meetings, events, or appointments mentioned.
+
+Then return your response as VALID JSON in exactly this format (no markdown, no extra text):
+{
+  "summary": "2-3 sentence plain-text summary of the document",
+  "events": [
+    {
+      "title": "Short event title",
+      "date": "YYYY-MM-DD",
+      "time": "HH:MM or null if not found",
+      "description": "Brief description of this event or deadline"
+    }
+  ]
+}
+
+If no specific dates are found, return an empty events array. Only return valid JSON.`;
 
     const response = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
@@ -226,8 +240,22 @@ Format your output in clean Markdown.`;
       }
     );
 
-    const extractedText = response.data.candidates?.[0]?.content?.parts?.[0]?.text || 'No text extracted.';
-    console.log(`✅ [Document] Analysis Complete`);
+    const raw = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+
+    // Robust JSON extraction — strip markdown fences if present
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const cleaned = jsonMatch ? jsonMatch[0] : '{}';
+
+    let parsed = { summary: 'Could not parse document.', events: [] };
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      console.warn('⚠️ [Document] JSON parse failed, returning raw text');
+      parsed.summary = raw.substring(0, 500);
+    }
+
+    console.log(`✅ [Document] Analysis Complete — ${parsed.events?.length || 0} events found`);
+
 
     // Auto-save to Supabase if we have a userId
     if (userId) {
@@ -237,12 +265,12 @@ Format your output in clean Markdown.`;
         transcript: 'Uploaded Document: ' + file.originalname,
         action: 'document_analysis',
         title: 'Document Analysis',
-        notes: extractedText,
+        notes: parsed.summary,
         status: 'done',
       });
     }
 
-    res.json({ text: extractedText });
+    res.json({ summary: parsed.summary, events: parsed.events || [] });
 
   } catch (error) {
     console.error('❌ [Document] Analysis Error:', error.response?.data?.error?.message || error.message);
