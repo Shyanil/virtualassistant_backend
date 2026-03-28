@@ -49,24 +49,33 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
     const { audioContent } = req.body;
     if (!audioContent) return res.status(400).json({ error: 'Missing audio content' });
 
-    console.log('🎙️ [Voice] Transcribing audio...');
+    console.log('🎙️ [Voice] Transcribing audio with Gemini 1.5 Flash...');
+    
+    // Using Gemini 1.5 Flash for transcription — it is extremely robust with audio formats
     const response = await axios.post(
-      `https://speech.googleapis.com/v1/speech:recognize?key=${process.env.GOOGLE_SPEECH_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
-        config: {
-          // Remove hardcoded encoding/rate to allow auto-detection from webm header
-          languageCode: 'en-US',
-          enableAutomaticPunctuation: true,
-        },
-        audio: { content: audioContent },
+        contents: [{ 
+          parts: [
+            { text: "Transcribe this audio file exactly as spoken. Just return the transcription text, nothing else. If you hear nothing, return an empty string." },
+            { inlineData: { mimeType: "audio/wav", data: audioContent } }
+          ] 
+        }],
+        generationConfig: {
+          temperature: 0.1,
+          topP: 0.95,
+          topK: 64,
+          maxOutputTokens: 1024,
+        }
       }
     );
 
-    const transcript = response.data.results?.[0]?.alternatives?.[0]?.transcript;
+    const transcript = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+    
     console.log('✅ [Voice] Transcript:', transcript || '[No speech detected]');
     res.json({ transcript });
   } catch (error) {
-    console.error('❌ [Voice] Transcription Error:', error.response?.data || error.message);
+    console.error('❌ [Voice] Transcription Error:', error.response?.data?.error?.message || error.message);
     res.status(500).json({ error: 'Transcription failed' });
   }
 });
