@@ -46,10 +46,13 @@ app.get('/health', (req, res) => {
  */
 app.post('/api/transcribe', validateApiKey, async (req, res) => {
   try {
-    const { audioContent } = req.body;
+    const { audioContent, mimeType } = req.body;
     if (!audioContent) return res.status(400).json({ error: 'Missing audio content' });
 
-    console.log('🎙️ [Voice] Transcribing audio with Gemini 1.5 Flash...');
+    // Use the MIME type sent by the client so Android AMR and iOS WAV/M4A all work.
+    // Fall back to audio/wav for backward compatibility.
+    const audioMimeType = mimeType || 'audio/wav';
+    console.log(`🎙️ [Voice] Transcribing audio (${audioMimeType}) with Gemini 1.5 Flash...`);
     
     // Using Gemini 1.5 Flash for transcription — it is extremely robust with audio formats
     const response = await axios.post(
@@ -58,7 +61,7 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
         contents: [{ 
           parts: [
             { text: "Transcribe this audio file exactly as spoken. Just return the transcription text, nothing else. If you hear nothing, return an empty string." },
-            { inlineData: { mimeType: "audio/wav", data: audioContent } }
+            { inlineData: { mimeType: audioMimeType, data: audioContent } }
           ] 
         }],
         generationConfig: {
@@ -75,8 +78,9 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
     console.log('✅ [Voice] Transcript:', transcript || '[No speech detected]');
     res.json({ transcript });
   } catch (error) {
-    console.error('❌ [Voice] Transcription Error:', error.response?.data?.error?.message || error.message);
-    res.status(500).json({ error: 'Transcription failed' });
+    const errMsg = error.response?.data?.error?.message || error.message;
+    console.error('❌ [Voice] Transcription Error:', errMsg);
+    res.status(500).json({ error: `Transcription failed: ${errMsg}` });
   }
 });
 
