@@ -49,18 +49,18 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
     const { audioContent, mimeType } = req.body;
     if (!audioContent) return res.status(400).json({ error: 'Missing audio content' });
 
-    // Use the MIME type sent by the client so Android AMR and iOS WAV/M4A all work.
+    // Use the MIME type sent by the client so Android M4A and iOS WAV both work.
     // Fall back to audio/wav for backward compatibility.
     const audioMimeType = mimeType || 'audio/wav';
-    console.log(`🎙️ [Voice] Transcribing audio (${audioMimeType}) with Gemini 1.5 Flash...`);
+    console.log(`🎙️ [Voice] Transcribing audio (${audioMimeType}) with Gemini 2.0 Flash...`);
     
-    // Using Gemini 1.5 Flash for transcription — it is extremely robust with audio formats
+    // gemini-2.0-flash supports multimodal audio input on the v1beta endpoint.
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [{ 
           parts: [
-            { text: "Transcribe this audio file exactly as spoken. Just return the transcription text, nothing else. If you hear nothing, return an empty string." },
+            { text: "Transcribe this audio file exactly as spoken. Return ONLY the transcription text with no extra commentary. If you hear nothing or the audio is silent, return an empty string." },
             { inlineData: { mimeType: audioMimeType, data: audioContent } }
           ] 
         }],
@@ -83,6 +83,7 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
     res.status(500).json({ error: `Transcription failed: ${errMsg}` });
   }
 });
+
 
 /**
  * 🤖 Model Selection Logic (Tiered Inference)
