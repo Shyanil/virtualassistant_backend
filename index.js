@@ -49,32 +49,49 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
     const { audioContent, mimeType } = req.body;
     if (!audioContent) return res.status(400).json({ error: 'Missing audio content' });
 
-    // Use the MIME type sent by the client so Android M4A and iOS WAV both work.
-    // Fall back to audio/wav for backward compatibility.
-    const audioMimeType = mimeType || 'audio/wav';
-    console.log(`🎙️ [Voice] Transcribing audio (${audioMimeType}) with Gemini 2.0 Flash...`);
-    
-    // gemini-2.0-flash supports multimodal audio input on the v1beta endpoint.
+    // Map MIME type → Google Speech-to-Text encoding config.
+    // iOS records WAV (LINEAR16), Android records AMR-WB — both supported natively.
+    let encoding = 'LINEAR16';
+    let sampleRateHertz = 16000;
+
+    if (mimeType === 'audio/amr-wb' || mimeType === 'audio/amr') {
+      encoding = 'AMR_WB';
+      sampleRateHertz = 16000;
+    } else if (mimeType === 'audio/mp3' || mimeType === 'audio/mpeg') {
+      encoding = 'MP3';
+      sampleRateHertz = 16000;
+    } else {
+      // Default: audio/wav → LINEAR16
+      encoding = 'LINEAR16';
+      sampleRateHertz = 16000;
+    }
+
+    console.log(`🎙️ [Voice] Transcribing (${mimeType || 'audio/wav'} → ${encoding}) with Google Speech-to-Text...`);
+
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://speech.googleapis.com/v1/speech:recognize?key=${process.env.GOOGLE_SPEECH_API_KEY}`,
       {
-        contents: [{ 
-          parts: [
-            { text: "Transcribe this audio file exactly as spoken. Return ONLY the transcription text with no extra commentary. If you hear nothing or the audio is silent, return an empty string." },
-            { inlineData: { mimeType: audioMimeType, data: audioContent } }
-          ] 
-        }],
-        generationConfig: {
-          temperature: 0.1,
-          topP: 0.95,
-          topK: 64,
-          maxOutputTokens: 1024,
-        }
+        config: {
+          encoding,
+          sampleRateHertz,
+          languageCode: 'en-US',
+          enableAutomaticPunctuation: true,
+          model: 'default',
+          useEnhanced: true,
+        },
+        audio: {
+          content: audioContent,
+        },
       }
     );
 
-    const transcript = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-    
+    // Join all result chunks into a single transcript string.
+    const transcript = (response.data.results || [])
+      .map(r => r.alternatives?.[0]?.transcript || '')
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+
     console.log('✅ [Voice] Transcript:', transcript || '[No speech detected]');
     res.json({ transcript });
   } catch (error) {
