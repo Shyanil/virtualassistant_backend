@@ -31,6 +31,58 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
+// ─── WhatsApp Integration (MSG91) ──────────────────────────────
+async function sendWhatsAppConfirmation(phoneNumber, data) {
+  const authKey = process.env.MSG91_AUTH_KEY;
+  const integratedNumber = process.env.MSG91_WHATSAPP_NUMBER;
+  const templateName = process.env.MSG91_TEMPLATE_NAME || 'meeting_confirmation';
+  const headerImage = process.env.MSG91_CONFIRMATION_IMAGE;
+
+  if (!authKey || !integratedNumber) {
+    console.warn('⚠️ [WhatsApp] MSG91 credentials missing, skipping...');
+    return;
+  }
+
+  // Clean phone number (strip symbols, ensure country code)
+  let cleanPhone = phoneNumber.replace(/\D/g, '');
+  if (cleanPhone.length === 10) cleanPhone = '91' + cleanPhone;
+
+  console.log(`📱 [WhatsApp] Sending confirmation to ${cleanPhone}...`);
+
+  const payload = {
+    integrated_number: integratedNumber,
+    content_type: "template",
+    payload: {
+      messaging_product: "whatsapp",
+      type: "template",
+      template: {
+        name: templateName,
+        language: { code: "en", policy: "deterministic" },
+        to_and_components: [{
+          to: [cleanPhone],
+          components: {
+            header_1: { type: "image", value: headerImage },
+            body_1: { type: "text", value: data.userName || 'Member' },
+            body_2: { type: "text", value: data.person || 'Team' },
+            body_3: { type: "text", value: data.date || 'TBD' },
+            body_4: { type: "text", value: data.time || 'TBD' },
+            body_5: { type: "text", value: data.link || 'Join Link in App' }
+          }
+        }]
+      }
+    }
+  };
+
+  try {
+    await axios.post('https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/', payload, {
+      headers: { 'authkey': authKey, 'Content-Type': 'application/json' }
+    });
+    console.log('✅ [WhatsApp] Confirmation sent successfully');
+  } catch (err) {
+    console.error('❌ [WhatsApp] MSG91 Error:', err.response?.data || err.message);
+  }
+}
+
 // ─── Endpoints ──────────────────────────────────────────────
 
 const path = require('path');
@@ -117,27 +169,68 @@ function selectModel(text) {
   }
 }
 
+function parseJsonObject(rawText) {
+  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+  const cleaned = jsonMatch ? jsonMatch[0] : rawText;
+  return JSON.parse(cleaned);
+}
+
+function toCalendarDateTime(date, time) {
+  return `${date.replace(/-/g, '')}T${String(time || '00:00').replace(':', '')}00`;
+}
+
+function buildGoogleCalendarUrl(intent, timeZone) {
+  if (!intent.date || !intent.time) return null;
+
+  const durationMinutes = Number(intent.durationMinutes) > 0 ? Number(intent.durationMinutes) : 60;
+  const [hours, minutes] = String(intent.time).split(':').map(Number);
+  const startDate = new Date(`${intent.date}T${String(intent.time)}:00`);
+  const endDate = new Date(startDate.getTime() + durationMinutes * 60 * 1000);
+  const endDateString = endDate.toISOString().slice(0, 10);
+  const endTimeString = endDate.toISOString().slice(11, 16);
+
+  intent.endDate = intent.endDate || endDateString;
+  intent.endTime = intent.endTime || endTimeString;
+
+  const params = new URLSearchParams({
+    action: 'TEMPLATE',
+    text: intent.title || 'New meeting',
+    details: intent.notes || intent.formattedText || 'Created from voice note',
+    dates: `${toCalendarDateTime(intent.date, intent.time)}/${toCalendarDateTime(intent.endDate, intent.endTime)}`,
+  });
+
+  if (timeZone) {
+    params.set('ctz', timeZone);
+  }
+
+  return `https://calendar.google.com/calendar/render?${params.toString()}`;
+}
+
 /**
  * 🧠 Analyze Intent (Gemini)
  * Receives: { transcript: '...', userId: '...' }
  */
 app.post('/api/analyze', validateApiKey, async (req, res) => {
   try {
-    const { transcript, userId } = req.body;
+    const { transcript, userId, timeZone } = req.body;
     if (!transcript) return res.status(400).json({ error: 'Missing transcript' });
 
     const model = selectModel(transcript);
     console.log(`🧠 [AI] Analyzing intent using ${model} for:`, transcript);
     
     const today = new Date().toISOString().split('T')[0];
-    const prompt = `Today is ${today}. User said: "${transcript}". 
-Extract intent. Return ONLY valid JSON:
+    const prompt = `Today is ${today}. User timezone is ${timeZone || 'UTC'}.
+User said: "${transcript}".
+Convert this into a clean calendar-ready structure.
+Return ONLY valid JSON:
 {
   "action": "create_event" or "set_reminder" or "unknown",
   "title": "short title",
   "date": "YYYY-MM-DD",
   "time": "HH:MM",
-  "notes": "context"
+  "durationMinutes": 60,
+  "notes": "short context for the calendar description",
+  "formattedText": "clean, easy-to-understand summary with key details"
 }`;
 
     const response = await axios.post(
@@ -149,58 +242,36 @@ Extract intent. Return ONLY valid JSON:
     );
 
     const raw = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-    // Robust JSON extraction
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    const cleaned = jsonMatch ? jsonMatch[0] : raw;
-    
     let intent;
     try {
-      intent = JSON.parse(cleaned);
+      intent = parseJsonObject(raw);
     } catch (parseError) {
       console.warn('⚠️ [AI] JSON Parse failed:', parseError.message);
       intent = { action: 'unknown', notes: 'Failed to parse AI response' };
     }
 
+    intent.formattedText = intent.formattedText || intent.notes || transcript;
+    intent.durationMinutes = Number(intent.durationMinutes) > 0 ? Number(intent.durationMinutes) : 60;
+    intent.timeZone = timeZone || 'UTC';
+    intent.calendarUrl = buildGoogleCalendarUrl(intent, intent.timeZone);
+
     console.log('✅ [AI] Intent:', JSON.stringify(intent));
-
-    // Execute Actions (e.g. Google Calendar)
-    const { googleAccessToken } = req.body;
-    let actionResult = null;
-
-    if (intent.action === 'create_event' && intent.date && intent.time && googleAccessToken) {
-      console.log('📅 [Action] Scheduling Google Meet event...');
-      try {
-        const startTime = new Date(`${intent.date}T${intent.time}:00`);
-        const endTime = new Date(startTime.getTime() + 60 * 60 * 1000); // Default 1 hour duration
-        
-        const eventBody = {
-          summary: intent.title,
-          description: intent.notes || 'Created by AI Assistant',
-          start: { dateTime: startTime.toISOString(), timeZone: 'UTC' },
-          end: { dateTime: endTime.toISOString(), timeZone: 'UTC' },
-          conferenceData: {
-            createRequest: { requestId: `meet-${Date.now()}`, conferenceSolutionKey: { type: "hangoutsMeet" } } // Auto create Meet link
-          }
-        };
-
-        const calRes = await axios.post(
-          'https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1',
-          eventBody,
-          { headers: { Authorization: `Bearer ${googleAccessToken}` } }
-        );
-
-        console.log('✅ [Action] Event Created:', calRes.data.htmlLink);
-        actionResult = 'Event Scheduled Successfully';
-        intent.meetLink = calRes.data.hangoutLink;
-      } catch (calError) {
-        console.error('❌ [Action] Google Calendar Error:', calError.response?.data || calError.message);
-        actionResult = 'Failed to Schedule Event';
-      }
-    }
 
     // Auto-save to Supabase if we have a userId
     if (userId) {
       console.log('💾 [DB] Saving to Supabase for user:', userId);
+      
+      // Fetch user profile for WhatsApp number (Graceful handling if user not in users table yet)
+      const { data: userData, error: profileError } = await supabase
+        .from('users')
+        .select('phone, full_name')
+        .eq('firebase_uid', userId)
+        .maybeSingle();
+
+      if (profileError) {
+        console.warn('⚠️ [DB] User profile fetch error:', profileError.message);
+      }
+
       await supabase.from('voice_logs').insert({
         user_id: userId,
         transcript,
@@ -209,8 +280,19 @@ Extract intent. Return ONLY valid JSON:
         date: intent.date,
         time: intent.time,
         notes: intent.notes,
-        status: actionResult === 'Failed to Schedule Event' ? 'error' : 'done',
+        status: intent.action === 'unknown' ? 'pending' : 'done',
       });
+
+      // Trigger WhatsApp if it's a meeting
+      if (intent.action === 'create_event' && userData?.phone) {
+        sendWhatsAppConfirmation(userData.phone, {
+          userName: userData.full_name,
+          person: intent.title?.split(' with ')?.[1] || 'Assistant',
+          date: intent.date,
+          time: intent.time,
+          link: intent.calendarUrl
+        });
+      }
     }
 
     res.json(intent);
