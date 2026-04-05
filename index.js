@@ -395,6 +395,165 @@ If no specific dates are found, return an empty events array. Only return valid 
 });
 
 
+// ─── WhatsApp Template: Meeting Confirmation ─────────────────────────
+/**
+ * 📲 Send Meeting Confirmation (meeting_confirmation_notification)
+ *
+ * Body (JSON):
+ * {
+ *   "to": ["91XXXXXXXXXX"],         // required — array of E.164 phone numbers (no +)
+ *   "name": "John Doe",             // required
+ *   "date": "5th April 2026",       // required
+ *   "time": "10:00 AM",             // required
+ *   "person": "Dr. Smith",          // required
+ *   "meeting_link": "https://...",  // required
+ *   "header_image": "https://..."   // optional — overrides MSG91_CONFIRMATION_IMAGE
+ * }
+ */
+app.post('/api/whatsapp/meeting-confirmation', validateApiKey, async (req, res) => {
+  try {
+    const authKey     = process.env.MSG91_AUTH_KEY;
+    const fromNumber  = process.env.MSG91_WHATSAPP_NUMBER;
+    const defaultImg  = process.env.MSG91_CONFIRMATION_IMAGE;
+
+    if (!authKey || !fromNumber) {
+      return res.status(500).json({ error: 'MSG91 credentials (MSG91_AUTH_KEY / MSG91_WHATSAPP_NUMBER) not configured in .env' });
+    }
+
+    const { to, name, date, time, person, meeting_link, header_image } = req.body;
+
+    if (!to || !Array.isArray(to) || to.length === 0) {
+      return res.status(400).json({ error: 'Missing or invalid "to" field — must be a non-empty array of phone numbers.' });
+    }
+    if (!name || !date || !time || !person || !meeting_link) {
+      return res.status(400).json({ error: 'Missing required fields: name, date, time, person, meeting_link' });
+    }
+
+    const headerImg = header_image || defaultImg || '';
+
+    const payload = {
+      integrated_number: fromNumber,
+      content_type: 'template',
+      payload: {
+        messaging_product: 'whatsapp',
+        type: 'template',
+        template: {
+          name: 'meeting_confirmation_notification',
+          language: { code: 'en', policy: 'deterministic' },
+          namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+          to_and_components: [{
+            to,
+            components: {
+              header_1:          { type: 'image', value: headerImg },
+              body_date:         { type: 'text', value: date,         parameter_name: 'date' },
+              body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+              body_person:       { type: 'text', value: person,       parameter_name: 'person' },
+              body_name:         { type: 'text', value: name,         parameter_name: 'name' },
+              body_time:         { type: 'text', value: time,         parameter_name: 'time' },
+            }
+          }]
+        }
+      }
+    };
+
+    console.log(`📲 [WhatsApp] Sending meeting-confirmation to ${to.join(', ')}...`);
+
+    const response = await axios.post(
+      'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+      payload,
+      { headers: { authkey: authKey, 'Content-Type': 'application/json' } }
+    );
+
+    console.log('✅ [WhatsApp] meeting-confirmation sent:', response.data);
+    res.json({ success: true, msg91Response: response.data });
+
+  } catch (err) {
+    console.error('❌ [WhatsApp] meeting-confirmation error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+
+// ─── WhatsApp Template: Meeting Invitation ───────────────────────────
+/**
+ * 📲 Send Meeting Invitation (meeting_invitation_notification)
+ *
+ * Body (JSON):
+ * {
+ *   "to": ["91XXXXXXXXXX"],         // required — array of E.164 phone numbers (no +)
+ *   "name": "John Doe",             // required
+ *   "date": "5th April 2026",       // required
+ *   "time": "10:00 AM",             // required
+ *   "person": "Dr. Smith",          // required
+ *   "meeting_link": "https://...",  // required
+ *   "header_image": "https://..."   // optional — overrides MSG91_CONFIRMATION_IMAGE
+ * }
+ */
+app.post('/api/whatsapp/meeting-invitation', validateApiKey, async (req, res) => {
+  try {
+    const authKey     = process.env.MSG91_AUTH_KEY;
+    const fromNumber  = process.env.MSG91_WHATSAPP_NUMBER;
+    const defaultImg  = process.env.MSG91_CONFIRMATION_IMAGE;
+
+    if (!authKey || !fromNumber) {
+      return res.status(500).json({ error: 'MSG91 credentials (MSG91_AUTH_KEY / MSG91_WHATSAPP_NUMBER) not configured in .env' });
+    }
+
+    const { to, name, date, time, person, meeting_link, header_image } = req.body;
+
+    if (!to || !Array.isArray(to) || to.length === 0) {
+      return res.status(400).json({ error: 'Missing or invalid "to" field — must be a non-empty array of phone numbers.' });
+    }
+    if (!name || !date || !time || !person || !meeting_link) {
+      return res.status(400).json({ error: 'Missing required fields: name, date, time, person, meeting_link' });
+    }
+
+    const headerImg = header_image || defaultImg || '';
+
+    const payload = {
+      integrated_number: fromNumber,
+      content_type: 'template',
+      payload: {
+        messaging_product: 'whatsapp',
+        type: 'template',
+        template: {
+          name: 'meeting_invitation_notification',
+          language: { code: 'en', policy: 'deterministic' },
+          namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+          to_and_components: [{
+            to,
+            components: {
+              header_1:          { type: 'image', value: headerImg },
+              body_name:         { type: 'text', value: name,         parameter_name: 'name' },
+              body_time:         { type: 'text', value: time,         parameter_name: 'time' },
+              body_person:       { type: 'text', value: person,       parameter_name: 'person' },
+              body_date:         { type: 'text', value: date,         parameter_name: 'date' },
+              body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+            }
+          }]
+        }
+      }
+    };
+
+    console.log(`📲 [WhatsApp] Sending meeting-invitation to ${to.join(', ')}...`);
+
+    const response = await axios.post(
+      'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+      payload,
+      { headers: { authkey: authKey, 'Content-Type': 'application/json' } }
+    );
+
+    console.log('✅ [WhatsApp] meeting-invitation sent:', response.data);
+    res.json({ success: true, msg91Response: response.data });
+
+  } catch (err) {
+    console.error('❌ [WhatsApp] meeting-invitation error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 AI Backend running at http://0.0.0.0:${PORT}`);
 });
