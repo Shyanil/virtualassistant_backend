@@ -445,11 +445,11 @@ app.post('/api/whatsapp/meeting-confirmation', validateApiKey, async (req, res) 
             to,
             components: {
               header_1:          { type: 'image', value: headerImg },
-              body_date:         { type: 'text', value: date,         parameter_name: 'date' },
-              body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
-              body_person:       { type: 'text', value: person,       parameter_name: 'person' },
-              body_name:         { type: 'text', value: name,         parameter_name: 'name' },
               body_time:         { type: 'text', value: time,         parameter_name: 'time' },
+              body_person:       { type: 'text', value: person,       parameter_name: 'person' },
+              body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+              body_date:         { type: 'text', value: date,         parameter_name: 'date' },
+              body_name:         { type: 'text', value: name,         parameter_name: 'name' },
             }
           }]
         }
@@ -524,11 +524,11 @@ app.post('/api/whatsapp/meeting-invitation', validateApiKey, async (req, res) =>
             to,
             components: {
               header_1:          { type: 'image', value: headerImg },
-              body_name:         { type: 'text', value: name,         parameter_name: 'name' },
-              body_time:         { type: 'text', value: time,         parameter_name: 'time' },
-              body_person:       { type: 'text', value: person,       parameter_name: 'person' },
               body_date:         { type: 'text', value: date,         parameter_name: 'date' },
               body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+              body_person:       { type: 'text', value: person,       parameter_name: 'person' },
+              body_name:         { type: 'text', value: name,         parameter_name: 'name' },
+              body_time:         { type: 'text', value: time,         parameter_name: 'time' },
             }
           }]
         }
