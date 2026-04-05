@@ -283,16 +283,8 @@ Return ONLY valid JSON:
         status: intent.action === 'unknown' ? 'pending' : 'done',
       });
 
-      // Trigger WhatsApp if it's a meeting
-      if (intent.action === 'create_event' && userData?.phone) {
-        sendWhatsAppConfirmation(userData.phone, {
-          userName: userData.full_name,
-          person: intent.title?.split(' with ')?.[1] || 'Assistant',
-          date: intent.date,
-          time: intent.time,
-          link: intent.calendarUrl
-        });
-      }
+      // ℹ️ WhatsApp confirmation is now sent ONLY after user confirms in the review screen
+      //    via POST /api/whatsapp/confirm-meeting — not here during analysis.
     }
 
     res.json(intent);
@@ -395,7 +387,52 @@ If no specific dates are found, return an empty events array. Only return valid 
 });
 
 
-// ─── WhatsApp Template: Meeting Confirmation ─────────────────────────
+// ─── WhatsApp Helper: Send MSG91 Confirmation Template ──────────────
+/**
+ * Internal helper — calls the meeting_confirmation_notification MSG91 template.
+ * Used by both the raw template endpoint and the centralized confirm endpoint.
+ */
+async function sendMeetingConfirmationWA({ to, name, date, time, person, meeting_link, header_image }) {
+  const authKey    = process.env.MSG91_AUTH_KEY;
+  const fromNumber = process.env.MSG91_WHATSAPP_NUMBER;
+  const defaultImg = process.env.MSG91_CONFIRMATION_IMAGE;
+  const headerImg  = header_image || defaultImg || '';
+
+  const payload = {
+    integrated_number: fromNumber,
+    content_type: 'template',
+    payload: {
+      messaging_product: 'whatsapp',
+      type: 'template',
+      template: {
+        name: 'meeting_confirmation_notification',
+        language: { code: 'en', policy: 'deterministic' },
+        namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+        to_and_components: [{
+          to,
+          components: {
+            header_1:          { type: 'image', value: headerImg },
+            body_name:         { type: 'text', value: name,         parameter_name: 'name' },
+            body_person:       { type: 'text', value: person,       parameter_name: 'person' },
+            body_date:         { type: 'text', value: date,         parameter_name: 'date' },
+            body_time:         { type: 'text', value: time,         parameter_name: 'time' },
+            body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+          }
+        }]
+      }
+    }
+  };
+
+  const response = await axios.post(
+    'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+    payload,
+    { headers: { authkey: authKey, 'Content-Type': 'application/json' } }
+  );
+  return response.data;
+}
+
+
+// ─── WhatsApp Template: Meeting Confirmation (raw endpoint) ──────────
 /**
  * 📲 Send Meeting Confirmation (meeting_confirmation_notification)
  *
@@ -412,16 +449,13 @@ If no specific dates are found, return an empty events array. Only return valid 
  */
 app.post('/api/whatsapp/meeting-confirmation', validateApiKey, async (req, res) => {
   try {
-    const authKey     = process.env.MSG91_AUTH_KEY;
-    const fromNumber  = process.env.MSG91_WHATSAPP_NUMBER;
-    const defaultImg  = process.env.MSG91_CONFIRMATION_IMAGE;
-
+    const authKey    = process.env.MSG91_AUTH_KEY;
+    const fromNumber = process.env.MSG91_WHATSAPP_NUMBER;
     if (!authKey || !fromNumber) {
-      return res.status(500).json({ error: 'MSG91 credentials (MSG91_AUTH_KEY / MSG91_WHATSAPP_NUMBER) not configured in .env' });
+      return res.status(500).json({ error: 'MSG91 credentials not configured in .env' });
     }
 
     const { to, name, date, time, person, meeting_link, header_image } = req.body;
-
     if (!to || !Array.isArray(to) || to.length === 0) {
       return res.status(400).json({ error: 'Missing or invalid "to" field — must be a non-empty array of phone numbers.' });
     }
@@ -429,43 +463,10 @@ app.post('/api/whatsapp/meeting-confirmation', validateApiKey, async (req, res) 
       return res.status(400).json({ error: 'Missing required fields: name, date, time, person, meeting_link' });
     }
 
-    const headerImg = header_image || defaultImg || '';
-
-    const payload = {
-      integrated_number: fromNumber,
-      content_type: 'template',
-      payload: {
-        messaging_product: 'whatsapp',
-        type: 'template',
-        template: {
-          name: 'meeting_confirmation_notification',
-          language: { code: 'en', policy: 'deterministic' },
-          namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
-          to_and_components: [{
-            to,
-            components: {
-              header_1:          { type: 'image', value: headerImg },
-              body_name:         { type: 'text', value: name,         parameter_name: 'name' },
-              body_person:       { type: 'text', value: person,       parameter_name: 'person' },
-              body_date:         { type: 'text', value: date,         parameter_name: 'date' },
-              body_time:         { type: 'text', value: time,         parameter_name: 'time' },
-              body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
-            }
-          }]
-        }
-      }
-    };
-
     console.log(`📲 [WhatsApp] Sending meeting-confirmation to ${to.join(', ')}...`);
-
-    const response = await axios.post(
-      'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
-      payload,
-      { headers: { authkey: authKey, 'Content-Type': 'application/json' } }
-    );
-
-    console.log('✅ [WhatsApp] meeting-confirmation sent:', response.data);
-    res.json({ success: true, msg91Response: response.data });
+    const result = await sendMeetingConfirmationWA({ to, name, date, time, person, meeting_link, header_image });
+    console.log('✅ [WhatsApp] meeting-confirmation sent:', result);
+    res.json({ success: true, msg91Response: result });
 
   } catch (err) {
     console.error('❌ [WhatsApp] meeting-confirmation error:', err.response?.data || err.message);
@@ -480,13 +481,13 @@ app.post('/api/whatsapp/meeting-confirmation', validateApiKey, async (req, res) 
  *
  * Body (JSON):
  * {
- *   "to": ["91XXXXXXXXXX"],         // required — array of E.164 phone numbers (no +)
- *   "name": "John Doe",             // required
- *   "date": "5th April 2026",       // required
- *   "time": "10:00 AM",             // required
- *   "person": "Dr. Smith",          // required
- *   "meeting_link": "https://...",  // required
- *   "header_image": "https://..."   // optional — overrides MSG91_CONFIRMATION_IMAGE
+ *   "to": ["91XXXXXXXXXX"],
+ *   "name": "John Doe",
+ *   "date": "5th April 2026",
+ *   "time": "10:00 AM",
+ *   "person": "Dr. Smith",
+ *   "meeting_link": "https://...",
+ *   "header_image": "https://..."   // optional
  * }
  */
 app.post('/api/whatsapp/meeting-invitation', validateApiKey, async (req, res) => {
@@ -496,7 +497,7 @@ app.post('/api/whatsapp/meeting-invitation', validateApiKey, async (req, res) =>
     const defaultImg  = process.env.MSG91_CONFIRMATION_IMAGE;
 
     if (!authKey || !fromNumber) {
-      return res.status(500).json({ error: 'MSG91 credentials (MSG91_AUTH_KEY / MSG91_WHATSAPP_NUMBER) not configured in .env' });
+      return res.status(500).json({ error: 'MSG91 credentials not configured in .env' });
     }
 
     const { to, name, date, time, person, meeting_link, header_image } = req.body;
@@ -553,7 +554,150 @@ app.post('/api/whatsapp/meeting-invitation', validateApiKey, async (req, res) =>
 });
 
 
+// ─── Confirm Meeting & Notify (Centralized Post-Confirmation Send) ─────
+/**
+ * 📲 POST /api/whatsapp/confirm-meeting
+ *
+ * Called by the app AFTER the user taps "Sync to Calendar" in the review screen.
+ * Works for all input sources: voice, write-note, document upload.
+ *
+ * Body (JSON):
+ * {
+ *   "userId":       "firebase_uid",           // required — used to look up phone from Supabase
+ *   "title":        "Meeting with Rahul",      // required
+ *   "date":         "2026-04-07",              // required — YYYY-MM-DD
+ *   "time":         "11:00",                   // required — HH:MM (24h)
+ *   "person":       "Rahul",                   // optional — defaults to "Team"
+ *   "meeting_link": "https://cal.google.com/…",// optional — calendar deeplink
+ *   "source":       "voice" | "note" | "document" | "calendar" // optional — for logging
+ * }
+ *
+ * Response:
+ * {
+ *   "sent": true/false,
+ *   "reason": "ok" | "no_phone" | "already_sent" | "msg91_error" | "db_error"
+ * }
+ */
+app.post('/api/whatsapp/confirm-meeting', validateApiKey, async (req, res) => {
+  const { userId, title, date, time, person, meeting_link, source } = req.body;
+  const logCtx = `[WhatsApp:confirm] source=${source || 'unknown'} userId=${userId}`;
+
+  if (!userId || !title || !date || !time) {
+    return res.status(400).json({
+      sent: false,
+      reason: 'missing_fields',
+      error: 'Required: userId, title, date, time'
+    });
+  }
+
+  try {
+    // 1️⃣ Fetch user phone + name from Supabase
+    const { data: userData, error: profileErr } = await supabase
+      .from('users')
+      .select('phone, full_name')
+      .eq('firebase_uid', userId)
+      .maybeSingle();
+
+    if (profileErr) {
+      console.error(`❌ ${logCtx} Supabase error:`, profileErr.message);
+      return res.json({ sent: false, reason: 'db_error' });
+    }
+
+    if (!userData?.phone) {
+      console.warn(`⚠️ ${logCtx} No phone number found — skipping WhatsApp`);
+      return res.json({ sent: false, reason: 'no_phone' });
+    }
+
+    // 2️⃣ Duplicate check — look for recent voice_log with same title+date+time already sent
+    const { data: existingLog } = await supabase
+      .from('voice_logs')
+      .select('id, whatsapp_sent')
+      .eq('user_id', userId)
+      .eq('title', title)
+      .eq('date', date)
+      .eq('time', time)
+      .eq('whatsapp_sent', true)
+      .maybeSingle();
+
+    if (existingLog) {
+      console.warn(`⚠️ ${logCtx} Duplicate: WhatsApp already sent for "${title}" on ${date} ${time}`);
+      return res.json({ sent: false, reason: 'already_sent' });
+    }
+
+    // 3️⃣ Format fields for the WhatsApp template
+    let cleanPhone = userData.phone.replace(/\D/g, '');
+    if (cleanPhone.length === 10) cleanPhone = '91' + cleanPhone;
+
+    // Format date: "2026-04-07" → "7th April 2026"
+    const dateObj = new Date(date + 'T00:00:00');
+    const day     = dateObj.getDate();
+    const suffix  = ['th','st','nd','rd'][(day % 10 > 3 || Math.floor(day / 10) === 1) ? 0 : day % 10] || 'th';
+    const months  = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const prettyDate = `${day}${suffix} ${months[dateObj.getMonth()]} ${dateObj.getFullYear()}`;
+
+    // Format time: "11:00" → "11:00 AM"
+    let prettyTime = time;
+    if (/^\d{1,2}:\d{2}$/.test(time)) {
+      const [h, m] = time.split(':').map(Number);
+      const ampm   = h >= 12 ? 'PM' : 'AM';
+      const hour   = h % 12 || 12;
+      prettyTime   = `${hour}:${String(m).padStart(2, '0')} ${ampm}`;
+    }
+
+    const waName        = userData.full_name || 'Member';
+    const waPerson      = person || 'Team';
+    const waMeetingLink = meeting_link || 'See calendar invite';
+
+    console.log(`📲 ${logCtx} Sending confirmation to +${cleanPhone} for "${title}" on ${prettyDate} ${prettyTime}`);
+
+    // 4️⃣ Send WhatsApp
+    let msg91Result;
+    try {
+      msg91Result = await sendMeetingConfirmationWA({
+        to:           [cleanPhone],
+        name:         waName,
+        date:         prettyDate,
+        time:         prettyTime,
+        person:       waPerson,
+        meeting_link: waMeetingLink,
+      });
+      console.log(`✅ ${logCtx} MSG91 success:`, msg91Result);
+    } catch (msg91Err) {
+      console.error(`❌ ${logCtx} MSG91 error:`, msg91Err.response?.data || msg91Err.message);
+      return res.json({ sent: false, reason: 'msg91_error', error: msg91Err.response?.data || msg91Err.message });
+    }
+
+    // 5️⃣ Mark as sent in voice_logs (upsert — graceful if column doesn't exist)
+    try {
+      await supabase.from('voice_logs').insert({
+        user_id:         userId,
+        transcript:      `[${source || 'app'}] Confirmed: ${title}`,
+        action:          'create_event',
+        title,
+        date,
+        time,
+        notes:           `WhatsApp confirmation sent to ${cleanPhone}`,
+        status:          'done',
+        whatsapp_sent:   true,
+      });
+    } catch (dbWriteErr) {
+      // Non-fatal: log but don't fail the response
+      console.warn(`⚠️ ${logCtx} Could not write whatsapp_sent flag:`, dbWriteErr.message);
+    }
+
+    return res.json({ sent: true, reason: 'ok', phone: `+${cleanPhone}` });
+
+  } catch (err) {
+    console.error(`❌ ${logCtx} Unexpected error:`, err.message);
+    return res.status(500).json({ sent: false, reason: 'server_error', error: err.message });
+  }
+});
+
+
 // ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 AI Backend running at http://0.0.0.0:${PORT}`);
 });
+
+
+
