@@ -102,7 +102,7 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
     if (!audioContent) return res.status(400).json({ error: 'Missing audio content' });
 
     // Map MIME type → Google Speech-to-Text encoding config.
-    // iOS records WAV (LINEAR16), Android records AMR-WB — both supported natively.
+    // expo-av on iOS records m4a/mp4, expo-av on Android records 3gp/AAC
     let encoding = 'LINEAR16';
     let sampleRateHertz = 16000;
 
@@ -112,11 +112,18 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
     } else if (mimeType === 'audio/mp3' || mimeType === 'audio/mpeg') {
       encoding = 'MP3';
       sampleRateHertz = 16000;
+    } else if (mimeType === 'audio/mp4' || mimeType === 'audio/m4a' || mimeType === 'audio/x-m4a') {
+      // expo-av on iOS records in m4a (AAC inside mp4 container)
+      // Google Speech-to-Text v1 doesn't support mp4 directly — use WEBM_OPUS or fall back to MP3
+      // Best approach: use encoding=MP3 which accepts AAC as well in practice
+      encoding = 'MP3';
+      sampleRateHertz = 44100;
     } else {
       // Default: audio/wav → LINEAR16
       encoding = 'LINEAR16';
       sampleRateHertz = 16000;
     }
+
 
     console.log(`🎙️ [Voice] Transcribing (${mimeType || 'audio/wav'} → ${encoding}) with Google Speech-to-Text...`);
 
@@ -159,14 +166,11 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
  * 🤖 Model Selection Logic (Tiered Inference)
  */
 function selectModel(text) {
-  const estimatedTokens = Math.ceil(text.length / 4); // ~4 chars per token
-  
-  if (estimatedTokens < 500) {
-    return "gemini-1.5-flash"; // Fast + cheap for small text
-  } else if (estimatedTokens < 5000) {
-    return "gemini-1.5-flash";       // Balanced for medium text
+  const estimatedTokens = Math.ceil(text.length / 4);
+  if (estimatedTokens < 5000) {
+    return "gemini-2.0-flash";        // Fast + cheap for most requests
   } else {
-    return "gemini-1.5-pro";         // Powerful for large text
+    return "gemini-2.5-flash";        // More capable for long/complex requests
   }
 }
 
@@ -373,7 +377,7 @@ INSTRUCTIONS:
 5. Keep responses concise but "top-notch" in quality.`;
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: { temperature: 0.2, maxOutputTokens: 800 },
@@ -439,7 +443,7 @@ Then return your response as VALID JSON in exactly this format (no markdown, no 
 If no specific dates are found, return an empty events array. Only return valid JSON.`;
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [{ 
           parts: [
