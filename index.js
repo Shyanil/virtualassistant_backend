@@ -138,13 +138,14 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
     );
 
     // Join all result chunks into a single transcript string.
+    console.log('✅ [Voice] Results:', JSON.stringify(response.data.results || []));
     const transcript = (response.data.results || [])
       .map(r => r.alternatives?.[0]?.transcript || '')
       .filter(Boolean)
       .join(' ')
       .trim();
 
-    console.log('✅ [Voice] Transcript:', transcript || '[No speech detected]');
+    console.log('✅ [Voice] Final Transcript:', transcript || '[No speech detected]');
     res.json({ transcript });
   } catch (error) {
     const errMsg = error.response?.data?.error?.message || error.message;
@@ -161,11 +162,11 @@ function selectModel(text) {
   const estimatedTokens = Math.ceil(text.length / 4); // ~4 chars per token
   
   if (estimatedTokens < 500) {
-    return "gemini-2.5-flash-lite"; // Fast + cheap for small text
+    return "gemini-1.5-flash"; // Fast + cheap for small text
   } else if (estimatedTokens < 5000) {
-    return "gemini-2.5-flash";       // Balanced for medium text
+    return "gemini-1.5-flash";       // Balanced for medium text
   } else {
-    return "gemini-2.5-pro";         // Powerful for large text
+    return "gemini-1.5-pro";         // Powerful for large text
   }
 }
 
@@ -242,12 +243,14 @@ Return ONLY valid JSON:
     );
 
     const raw = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    console.log('🤖 [AI] Raw response from Gemini:', raw);
+    
     let intent;
     try {
       intent = parseJsonObject(raw);
     } catch (parseError) {
       console.warn('⚠️ [AI] JSON Parse failed:', parseError.message);
-      intent = { action: 'unknown', notes: 'Failed to parse AI response' };
+      intent = { action: 'unknown', notes: `Failed to parse AI response: ${raw.substring(0, 100)}` };
     }
 
     intent.formattedText = intent.formattedText || intent.notes || transcript;
@@ -294,6 +297,106 @@ Return ONLY valid JSON:
   }
 });
 
+/**
+ * 💬 Calendar-aware Chat (Gemini)
+ * Receives: { message, userId, history, timeZone }
+ */
+app.post('/api/chat', validateApiKey, async (req, res) => {
+  try {
+    const { message, userId, history = [], timeZone } = req.body;
+    if (!message) return res.status(400).json({ error: 'Missing message' });
+
+    const requestedTimeZone = timeZone || 'UTC';
+    const formatDateInZone = (date) => {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: requestedTimeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).formatToParts(date);
+      const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+      return `${values.year}-${values.month}-${values.day}`;
+    };
+
+    const now = new Date();
+    const rangeEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); // Next 7 days
+    const today = formatDateInZone(now);
+    const end = formatDateInZone(rangeEnd);
+
+    let contextEvents = [];
+    if (userId) {
+      const { data, error } = await supabase
+        .from('voice_logs')
+        .select('title, date, time, notes, transcript, action, status')
+        .eq('user_id', userId)
+        .not('date', 'is', null)
+        .gte('date', today)
+        .lte('date', end)
+        .order('date', { ascending: true })
+        .order('time', { ascending: true })
+        .limit(20);
+
+      if (error) {
+        console.warn('⚠️ [Chat] Supabase context query failed:', error.message);
+      } else {
+        contextEvents = data || [];
+      }
+    }
+
+    const scheduleText = contextEvents.length
+      ? contextEvents.map((event, index) => {
+          const when = [event.date, event.time].filter(Boolean).join(' ');
+          return `${index + 1}. ${event.title || event.action || 'Untitled'} (${when || 'time unknown'}) - ${event.notes || event.transcript || 'No notes'}`;
+        }).join('\n')
+      : 'No upcoming events found in the next 7 days.';
+
+    const recentHistory = Array.isArray(history)
+      ? history.slice(-8).map(item => `${item.role === 'assistant' ? 'Assistant' : 'User'}: ${item.content}`).join('\n')
+      : '';
+
+    const prompt = `You are Adamsalve, the user's high-end personal calendar assistant.
+Today is ${today}. User timezone: ${requestedTimeZone}.
+
+USER SCHEDULE FOR THE NEXT 7 DAYS:
+${scheduleText}
+
+CONVERSATION HISTORY:
+${recentHistory || 'First interaction.'}
+
+USER REQUEST: "${message}"
+
+INSTRUCTIONS:
+1. Be professional, concierge-like, and helpful.
+2. Focus ONLY on the user's calendar and schedule.
+3. If they ask about "upcoming" things, summarize the next few events from the schedule provided above.
+4. If they ask about something not in their calendar (like general knowledge or images), politely pivot back to how you can help with their schedule.
+5. Keep responses concise but "top-notch" in quality.`;
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 800 },
+      }
+    );
+
+    const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 'I could not generate a response.';
+
+    res.json({
+      reply,
+      contextEvents: contextEvents.map(event => ({
+        title: event.title,
+        date: event.date,
+        time: event.time,
+        notes: event.notes,
+      })),
+    });
+  } catch (error) {
+    console.error('❌ [Chat] Error:', error.response?.data?.error?.message || error.message);
+    res.status(500).json({ error: 'Chat failed' });
+  }
+});
+
 
 const multer = require('multer');
 const upload = multer({ 
@@ -336,7 +439,7 @@ Then return your response as VALID JSON in exactly this format (no markdown, no 
 If no specific dates are found, return an empty events array. Only return valid JSON.`;
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [{ 
           parts: [
@@ -698,6 +801,4 @@ app.post('/api/whatsapp/confirm-meeting', validateApiKey, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 AI Backend running at http://0.0.0.0:${PORT}`);
 });
-
-
 
