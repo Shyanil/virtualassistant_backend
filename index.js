@@ -168,7 +168,7 @@ app.post('/api/transcribe', validateApiKey, async (req, res) => {
 function selectModel(text) {
   const estimatedTokens = Math.ceil(text.length / 4);
   if (estimatedTokens < 5000) {
-    return "gemini-2.0-flash";        // Fast + cheap for most requests
+    return "gemini-2.5-flash";        // Fast + cheap for most requests
   } else {
     return "gemini-2.5-flash";        // More capable for long/complex requests
   }
@@ -377,7 +377,7 @@ INSTRUCTIONS:
 5. Keep responses concise but "top-notch" in quality.`;
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: { temperature: 0.2, maxOutputTokens: 800 },
@@ -443,7 +443,7 @@ Then return your response as VALID JSON in exactly this format (no markdown, no 
 If no specific dates are found, return an empty events array. Only return valid JSON.`;
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [{ 
           parts: [
