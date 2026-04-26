@@ -801,6 +801,69 @@ app.post('/api/whatsapp/confirm-meeting', validateApiKey, async (req, res) => {
 });
 
 
+/**
+ * 📅 Create Google Calendar Event
+ * Receives: { accessToken, title, description, date, time, durationMinutes, timeZone }
+ */
+app.post('/api/google/create-event', validateApiKey, async (req, res) => {
+  try {
+    const { accessToken, title, description, date, time, durationMinutes, timeZone } = req.body;
+    
+    if (!accessToken) return res.status(400).json({ error: 'Missing Google access token' });
+    if (!title || !date || !time) return res.status(400).json({ error: 'Missing event details' });
+
+    const startTime = new Date(`${date}T${time}:00`);
+    const duration = Number(durationMinutes) || 60;
+    const endTime = new Date(startTime.getTime() + duration * 60 * 1000);
+
+    console.log(`📅 [Google] Creating event: "${title}" on ${date} ${time} with Meet link...`);
+
+    const event = {
+      summary: title,
+      description: description || 'Created via Adamsalve AI',
+      start: {
+        dateTime: startTime.toISOString(),
+        timeZone: timeZone || 'UTC',
+      },
+      end: {
+        dateTime: endTime.toISOString(),
+        timeZone: timeZone || 'UTC',
+      },
+      conferenceData: {
+        createRequest: {
+          requestId: `syncra-${Date.now()}`,
+          conferenceSolutionKey: { type: 'hangoutsMeet' },
+        },
+      },
+    };
+
+    const response = await axios.post(
+      'https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1',
+      event,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    console.log('✅ [Google] Event created:', response.data.htmlLink);
+    
+    const meetLink = response.data.conferenceData?.entryPoints?.find(ep => ep.entryPointType === 'video')?.uri;
+
+    res.json({
+      success: true,
+      eventLink: response.data.htmlLink,
+      meetLink: meetLink || null,
+      eventId: response.data.id
+    });
+  } catch (error) {
+    console.error('❌ [Google] Calendar Error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to create calendar event', details: error.response?.data || error.message });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 AI Backend running at http://0.0.0.0:${PORT}`);
