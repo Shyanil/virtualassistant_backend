@@ -358,7 +358,7 @@ app.post('/api/chat', validateApiKey, async (req, res) => {
       ? history.slice(-8).map(item => `${item.role === 'assistant' ? 'Assistant' : 'User'}: ${item.content}`).join('\n')
       : '';
 
-    const prompt = `You are Adamsalve, the user's high-end personal calendar assistant.
+    const prompt = `You are Adamslave, the user's high-end personal calendar assistant.
 Today is ${today}. User timezone: ${requestedTimeZone}.
 
 USER SCHEDULE FOR THE NEXT 7 DAYS:
@@ -820,7 +820,7 @@ app.post('/api/google/create-event', validateApiKey, async (req, res) => {
 
     const event = {
       summary: title,
-      description: description || 'Created via Adamsalve AI',
+      description: description || 'Created via Adamslave',
       start: {
         dateTime: startTime.toISOString(),
         timeZone: timeZone || 'UTC',
@@ -831,7 +831,7 @@ app.post('/api/google/create-event', validateApiKey, async (req, res) => {
       },
       conferenceData: {
         createRequest: {
-          requestId: `syncra-${Date.now()}`,
+          requestId: `adamslave-${Date.now()}`,
           conferenceSolutionKey: { type: 'hangoutsMeet' },
         },
       },
@@ -868,4 +868,3 @@ app.post('/api/google/create-event', validateApiKey, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 AI Backend running at http://0.0.0.0:${PORT}`);
 });
-
