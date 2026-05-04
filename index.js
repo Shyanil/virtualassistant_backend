@@ -261,6 +261,75 @@ function buildGoogleCalendarUrl(intent, timeZone) {
   return `https://calendar.google.com/calendar/render?${params.toString()}`;
 }
 
+function extractAttendeeName(text) {
+  if (!text) return null;
+
+  const match = String(text).match(/\bwith\s+([A-Za-z][A-Za-z\s.'-]{1,60})/i);
+  if (!match?.[1]) return null;
+
+  return match[1]
+    .replace(/\b(today|tomorrow|at|on|by|for)\b.*$/i, '')
+    .trim() || null;
+}
+
+function getDateTimePartsInZone(date, timeZone = 'UTC') {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+
+  return {
+    date: `${values.year}-${values.month}-${values.day}`,
+    time: `${values.hour}:${values.minute}`,
+  };
+}
+
+function getTimeZoneOffsetMs(date, timeZone = 'UTC') {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  const asUtc = Date.UTC(
+    Number(values.year),
+    Number(values.month) - 1,
+    Number(values.day),
+    Number(values.hour),
+    Number(values.minute),
+    Number(values.second)
+  );
+
+  return asUtc - date.getTime();
+}
+
+function localDateTimeToUtc(dateString, timeString, timeZone = 'UTC') {
+  if (!dateString || !timeString) {
+    throw new Error('event_date and event_time are required');
+  }
+
+  const normalizedTime = String(timeString).slice(0, 5);
+  const utcGuess = new Date(`${dateString}T${normalizedTime}:00.000Z`);
+
+  if (Number.isNaN(utcGuess.getTime())) {
+    throw new Error('event_date/event_time must be valid');
+  }
+
+  const offsetMs = getTimeZoneOffsetMs(utcGuess, timeZone);
+  return new Date(utcGuess.getTime() - offsetMs);
+}
+
 async function saveVoiceLog({ userId, transcript, intent, source = 'analyze' }) {
   const effectiveUserId = userId || 'dev-expo-anonymous';
 
@@ -290,6 +359,35 @@ async function saveVoiceLog({ userId, transcript, intent, source = 'analyze' }) 
   };
 }
 
+async function saveExtractedEventFromIntent({ transcript, intent }) {
+  if (!['create_event', 'set_reminder'].includes(intent.action) || !intent.title) {
+    return { saved: false, id: null, skipped: true, error: null };
+  }
+
+  const { data, error } = await supabase
+    .from('extracted_events')
+    .insert({
+      event_title: intent.title,
+      event_date: intent.date || null,
+      event_time: intent.time || null,
+      timezone: intent.timeZone || 'Asia/Kolkata',
+      attendee_name: extractAttendeeName(intent.title) || extractAttendeeName(transcript),
+      confidence: null,
+      status: 'detected',
+      context_sentence: transcript,
+      whatsapp_reminder_status: 'pending',
+      call_reminder_status: 'pending',
+    })
+    .select('id')
+    .single();
+
+  if (error) {
+    throw error;
+  }
+
+  return { saved: true, id: data?.id || null, skipped: false, error: null };
+}
+
 /**
  * 🧠 Analyze Intent (Gemini)
  * Receives: { transcript: '...', userId: '...' }
@@ -303,6 +401,12 @@ app.post('/api/analyze', validateApiKey, async (req, res) => {
       id: null,
       userId: userId || 'dev-expo-anonymous',
       usedFallbackUserId: !userId,
+      error: null,
+    };
+    let extractedEventResult = {
+      saved: false,
+      id: null,
+      skipped: false,
       error: null,
     };
 
@@ -381,6 +485,19 @@ Return ONLY valid JSON:
       console.error('❌ [DB] Voice log save failed:', dbError);
     }
 
+    try {
+      console.log('💾 [DB] Saving extracted event from analyzed intent...');
+      extractedEventResult = await saveExtractedEventFromIntent({ transcript, intent });
+      if (extractedEventResult.skipped) {
+        console.log('ℹ️ [DB] Extracted event save skipped for action:', intent.action);
+      } else {
+        console.log('✅ [DB] Extracted event saved:', extractedEventResult);
+      }
+    } catch (eventDbError) {
+      extractedEventResult.error = eventDbError.message;
+      console.error('❌ [DB] Extracted event save failed:', eventDbError);
+    }
+
     res.json({
       ...intent,
       db_saved: dbResult.saved,
@@ -388,6 +505,10 @@ Return ONLY valid JSON:
       db_user_id: dbResult.userId,
       db_used_fallback_user_id: dbResult.usedFallbackUserId,
       db_error: dbResult.error,
+      extracted_event_saved: extractedEventResult.saved,
+      extracted_event_id: extractedEventResult.id,
+      extracted_event_skipped: extractedEventResult.skipped,
+      extracted_event_error: extractedEventResult.error,
     });
   } catch (error) {
     console.error('❌ [AI] Analysis Error:', error.response?.data?.error?.message || error.message);
@@ -901,9 +1022,11 @@ app.post('/api/whatsapp/confirm-meeting', validateApiKey, async (req, res) => {
  *
  * Body can override/fill these fields:
  * {
- *   "customer_name": "Rahul",
- *   "customer_phone": "+919999999999",
- *   "meeting_time": "2026-05-04T17:00:00+05:30",
+ *   "attendee_name": "Rahul",
+ *   "attendee_phone": "+919999999999",
+ *   "event_date": "2026-05-04",
+ *   "event_time": "17:00",
+ *   "timezone": "Asia/Kolkata",
  *   "event_title": "Sales Call"
  * }
  */
@@ -921,28 +1044,51 @@ app.patch('/api/events/:id/confirm', validateApiKey, async (req, res) => {
       throw fetchError;
     }
 
-    const customerName = req.body.customer_name || existingEvent.customer_name || existingEvent.name || null;
-    const customerPhone = req.body.customer_phone || existingEvent.customer_phone || existingEvent.phone || null;
-    const meetingTime = req.body.meeting_time || existingEvent.meeting_time || existingEvent.start_time || null;
-    const eventTitle = req.body.event_title || existingEvent.event_title || existingEvent.title || 'Meeting';
+    const attendeeName = req.body.attendee_name || req.body.customer_name || existingEvent.attendee_name || null;
+    const attendeePhone = req.body.attendee_phone || req.body.customer_phone || existingEvent.attendee_phone || null;
+    const eventTitle = req.body.event_title || existingEvent.event_title || 'Meeting';
+    const timezone = req.body.timezone || existingEvent.timezone || 'Asia/Kolkata';
+    let eventDate = req.body.event_date || existingEvent.event_date || null;
+    let eventTime = req.body.event_time || existingEvent.event_time || null;
+    let meetingDate;
 
-    if (!customerPhone || !meetingTime) {
+    if (req.body.meeting_time) {
+      meetingDate = new Date(req.body.meeting_time);
+      if (Number.isNaN(meetingDate.getTime())) {
+        return res.status(400).json({ error: 'meeting_time must be a valid date/time' });
+      }
+      const parts = getDateTimePartsInZone(meetingDate, timezone);
+      eventDate = parts.date;
+      eventTime = parts.time;
+    } else {
+      if (!eventDate || !eventTime) {
+        return res.status(400).json({
+          error: 'event_date and event_time are required when meeting_time is not provided',
+        });
+      }
+      meetingDate = localDateTimeToUtc(eventDate, eventTime, timezone);
+      eventTime = String(eventTime).slice(0, 5);
+    }
+
+    if (!attendeePhone || !eventDate || !eventTime) {
       return res.status(400).json({
-        error: 'customer_phone and meeting_time are required',
+        error: 'attendee_phone, event_date, and event_time are required',
       });
     }
 
-    const whatsappReminderDate = calculateReminderDate(meetingTime, WHATSAPP_REMINDER_LEAD_MINUTES);
-    const callReminderDate = calculateReminderDate(meetingTime, CALL_REMINDER_LEAD_MINUTES);
+    const whatsappReminderDate = calculateReminderDate(meetingDate.toISOString(), WHATSAPP_REMINDER_LEAD_MINUTES);
+    const callReminderDate = calculateReminderDate(meetingDate.toISOString(), CALL_REMINDER_LEAD_MINUTES);
     const now = new Date();
     const whatsappStatus = whatsappReminderDate <= now ? 'skipped' : 'pending';
 
     const updatePayload = {
       status: 'confirmed',
-      customer_name: customerName,
-      customer_phone: customerPhone,
+      attendee_name: attendeeName,
+      attendee_phone: attendeePhone,
       event_title: eventTitle,
-      meeting_time: new Date(meetingTime).toISOString(),
+      event_date: eventDate,
+      event_time: eventTime,
+      timezone,
       whatsapp_reminder_at: whatsappReminderDate.toISOString(),
       call_reminder_at: callReminderDate.toISOString(),
       whatsapp_reminder_status: whatsappStatus,
@@ -962,10 +1108,15 @@ app.patch('/api/events/:id/confirm', validateApiKey, async (req, res) => {
 
     const n8nPayload = {
       event_id: updatedEvent.id,
-      customer_name: customerName,
-      customer_phone: customerPhone,
+      customer_name: attendeeName,
+      customer_phone: attendeePhone,
+      attendee_name: attendeeName,
+      attendee_phone: attendeePhone,
       event_title: eventTitle,
-      meeting_time: updatePayload.meeting_time,
+      meeting_time: meetingDate.toISOString(),
+      event_date: eventDate,
+      event_time: eventTime,
+      timezone,
       whatsapp_reminder_at: whatsappReminderDate.toISOString(),
     };
 
