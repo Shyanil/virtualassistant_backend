@@ -1284,6 +1284,118 @@ app.patch('/api/events/:id/confirm', validateApiKey, async (req, res) => {
 });
 
 /**
+ * 🕒 Check if a delayed n8n reminder execution is still valid.
+ *
+ * GET /api/events/:id/reminder-check?channel=whatsapp&reminder_at=2026-05-04T15:40:00.000Z
+ */
+app.get('/api/events/:id/reminder-check', requireN8nSharedSecret, async (req, res) => {
+  try {
+    const eventId = req.params.id;
+    const channel = req.query.channel || 'whatsapp';
+    const reminderAt = req.query.reminder_at;
+
+    if (channel !== 'whatsapp') {
+      return res.status(400).json({
+        allowed: false,
+        reason: 'unsupported_channel',
+      });
+    }
+
+    if (!reminderAt) {
+      return res.status(400).json({
+        allowed: false,
+        reason: 'missing_reminder_at',
+      });
+    }
+
+    const requestedReminderDate = new Date(String(reminderAt));
+    if (Number.isNaN(requestedReminderDate.getTime())) {
+      return res.status(400).json({
+        allowed: false,
+        reason: 'invalid_reminder_at',
+      });
+    }
+
+    const { data: event, error } = await supabase
+      .from('extracted_events')
+      .select('*')
+      .eq('id', eventId)
+      .single();
+
+    if (error || !event) {
+      return res.status(404).json({
+        allowed: false,
+        reason: 'event_not_found',
+      });
+    }
+
+    const userPhone = cleanPhoneNumber(event.user_phone);
+    const attendeePhone = cleanPhoneNumber(event.attendee_phone);
+    const reminderDate = event.whatsapp_reminder_at ? new Date(event.whatsapp_reminder_at) : null;
+    const reminderMatches = reminderDate
+      && Math.abs(reminderDate.getTime() - requestedReminderDate.getTime()) < 1000;
+
+    if (event.status === 'cancelled') {
+      return res.json({ allowed: false, reason: 'event_cancelled' });
+    }
+
+    if (event.status !== 'confirmed') {
+      return res.json({ allowed: false, reason: 'event_not_confirmed', status: event.status });
+    }
+
+    if (event.whatsapp_reminder_status !== 'pending') {
+      return res.json({
+        allowed: false,
+        reason: event.whatsapp_reminder_status === 'sent' ? 'reminder_already_sent' : 'reminder_not_pending',
+        whatsapp_reminder_status: event.whatsapp_reminder_status,
+      });
+    }
+
+    if (!reminderMatches) {
+      return res.json({
+        allowed: false,
+        reason: 'reminder_time_changed',
+        current_reminder_at: event.whatsapp_reminder_at,
+        requested_reminder_at: requestedReminderDate.toISOString(),
+      });
+    }
+
+    if (!userPhone || !attendeePhone) {
+      return res.json({
+        allowed: false,
+        reason: 'missing_recipient_phone',
+        user_phone_present: Boolean(userPhone),
+        attendee_phone_present: Boolean(attendeePhone),
+      });
+    }
+
+    const meetingDate = localDateTimeToUtc(event.event_date, event.event_time, event.timezone || 'Asia/Kolkata');
+    const payload = buildReminderJobPayload({
+      event,
+      userPhone,
+      attendeeName: event.attendee_name,
+      attendeePhone,
+      meetingDate,
+      whatsappReminderDate: reminderDate,
+    });
+
+    return res.json({
+      allowed: true,
+      reason: 'ok',
+      event: payload,
+    });
+  } catch (error) {
+    console.error('❌ [Reminders] Reminder check error:', error);
+
+    return res.status(500).json({
+      allowed: false,
+      reason: 'server_error',
+      error: error.message,
+    });
+  }
+});
+
+/**
  * 🕒 Receive WhatsApp reminder result from n8n
  *
  * n8n must send the shared secret in the x-shared-secret header.
