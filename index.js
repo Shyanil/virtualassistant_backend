@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const morgan = require('morgan');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -30,6 +31,55 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
+
+const WHATSAPP_REMINDER_LEAD_MINUTES = 20;
+const CALL_REMINDER_LEAD_MINUTES = 5;
+
+function isSharedSecretValid(incomingSecret) {
+  const expectedSecret = process.env.N8N_SHARED_SECRET;
+  if (!expectedSecret || !incomingSecret) return false;
+
+  const incoming = Buffer.from(String(incomingSecret));
+  const expected = Buffer.from(String(expectedSecret));
+
+  return incoming.length === expected.length && crypto.timingSafeEqual(incoming, expected);
+}
+
+function requireN8nSharedSecret(req, res, next) {
+  if (!isSharedSecretValid(req.headers['x-shared-secret'])) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  next();
+}
+
+function calculateReminderDate(meetingTime, leadMinutes) {
+  const meetingDate = new Date(meetingTime);
+
+  if (Number.isNaN(meetingDate.getTime())) {
+    throw new Error('meeting_time must be a valid date/time');
+  }
+
+  return new Date(meetingDate.getTime() - leadMinutes * 60 * 1000);
+}
+
+async function sendWhatsAppReminderJobToN8n(payload) {
+  const webhookUrl = process.env.N8N_WHATSAPP_WEBHOOK_URL;
+
+  if (!webhookUrl) {
+    throw new Error('N8N_WHATSAPP_WEBHOOK_URL is missing');
+  }
+
+  const response = await axios.post(webhookUrl, payload, {
+    headers: {
+      'Content-Type': 'application/json',
+      'x-shared-secret': process.env.N8N_SHARED_SECRET || '',
+    },
+    timeout: 10000,
+  });
+
+  return response.data;
+}
 
 // ─── WhatsApp Integration (MSG91) ──────────────────────────────
 async function sendWhatsAppConfirmation(phoneNumber, data) {
@@ -797,6 +847,182 @@ app.post('/api/whatsapp/confirm-meeting', validateApiKey, async (req, res) => {
   } catch (err) {
     console.error(`❌ ${logCtx} Unexpected error:`, err.message);
     return res.status(500).json({ sent: false, reason: 'server_error', error: err.message });
+  }
+});
+
+/**
+ * 🕒 Confirm an extracted event and enqueue the WhatsApp reminder in n8n
+ *
+ * PATCH /api/events/:id/confirm
+ *
+ * Body can override/fill these fields:
+ * {
+ *   "customer_name": "Rahul",
+ *   "customer_phone": "+919999999999",
+ *   "meeting_time": "2026-05-04T17:00:00+05:30",
+ *   "event_title": "Sales Call"
+ * }
+ */
+app.patch('/api/events/:id/confirm', validateApiKey, async (req, res) => {
+  const eventId = req.params.id;
+
+  try {
+    const { data: existingEvent, error: fetchError } = await supabase
+      .from('extracted_events')
+      .select('*')
+      .eq('id', eventId)
+      .single();
+
+    if (fetchError) {
+      throw fetchError;
+    }
+
+    const customerName = req.body.customer_name || existingEvent.customer_name || existingEvent.name || null;
+    const customerPhone = req.body.customer_phone || existingEvent.customer_phone || existingEvent.phone || null;
+    const meetingTime = req.body.meeting_time || existingEvent.meeting_time || existingEvent.start_time || null;
+    const eventTitle = req.body.event_title || existingEvent.event_title || existingEvent.title || 'Meeting';
+
+    if (!customerPhone || !meetingTime) {
+      return res.status(400).json({
+        error: 'customer_phone and meeting_time are required',
+      });
+    }
+
+    const whatsappReminderDate = calculateReminderDate(meetingTime, WHATSAPP_REMINDER_LEAD_MINUTES);
+    const callReminderDate = calculateReminderDate(meetingTime, CALL_REMINDER_LEAD_MINUTES);
+    const now = new Date();
+    const whatsappStatus = whatsappReminderDate <= now ? 'skipped' : 'pending';
+
+    const updatePayload = {
+      status: 'confirmed',
+      customer_name: customerName,
+      customer_phone: customerPhone,
+      event_title: eventTitle,
+      meeting_time: new Date(meetingTime).toISOString(),
+      whatsapp_reminder_at: whatsappReminderDate.toISOString(),
+      call_reminder_at: callReminderDate.toISOString(),
+      whatsapp_reminder_status: whatsappStatus,
+      reminder_error: null,
+    };
+
+    const { data: updatedEvent, error: updateError } = await supabase
+      .from('extracted_events')
+      .update(updatePayload)
+      .eq('id', eventId)
+      .select()
+      .single();
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    const n8nPayload = {
+      event_id: updatedEvent.id,
+      customer_name: customerName,
+      customer_phone: customerPhone,
+      event_title: eventTitle,
+      meeting_time: updatePayload.meeting_time,
+      whatsapp_reminder_at: whatsappReminderDate.toISOString(),
+    };
+
+    let n8nResponse = null;
+
+    if (whatsappStatus === 'pending') {
+      try {
+        n8nResponse = await sendWhatsAppReminderJobToN8n(n8nPayload);
+      } catch (n8nError) {
+        const errorMessage = n8nError.response?.data || n8nError.message;
+
+        await supabase
+          .from('extracted_events')
+          .update({
+            whatsapp_reminder_status: 'failed',
+            reminder_error: typeof errorMessage === 'string' ? errorMessage : JSON.stringify(errorMessage),
+          })
+          .eq('id', eventId);
+
+        return res.status(502).json({
+          success: false,
+          error: 'Failed to send WhatsApp reminder job to n8n',
+          details: errorMessage,
+          n8n_payload: n8nPayload,
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      event: updatedEvent,
+      n8n_triggered: whatsappStatus === 'pending',
+      n8n_payload: n8nPayload,
+      n8n_response: n8nResponse,
+    });
+  } catch (error) {
+    console.error('❌ [Events] Confirm event error:', error);
+
+    return res.status(500).json({
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * 🕒 Receive WhatsApp reminder result from n8n
+ *
+ * n8n must send the shared secret in the x-shared-secret header.
+ */
+app.post('/api/reminders/whatsapp-result', requireN8nSharedSecret, async (req, res) => {
+  try {
+    const { event_id, status, sent_at, error_message } = req.body;
+
+    if (!event_id || !status) {
+      return res.status(400).json({
+        error: 'event_id and status are required',
+      });
+    }
+
+    const allowedStatuses = ['sent', 'failed', 'cancelled', 'skipped'];
+
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        error: 'Invalid WhatsApp reminder status',
+      });
+    }
+
+    const updatePayload = {
+      whatsapp_reminder_status: status,
+    };
+
+    if (status === 'sent') {
+      updatePayload.whatsapp_sent_at = sent_at || new Date().toISOString();
+      updatePayload.reminder_error = null;
+    }
+
+    if (status === 'failed') {
+      updatePayload.reminder_error = error_message || 'WhatsApp sending failed';
+    }
+
+    const { data, error } = await supabase
+      .from('extracted_events')
+      .update(updatePayload)
+      .eq('id', event_id)
+      .select()
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return res.json({
+      success: true,
+      event: data,
+    });
+  } catch (error) {
+    console.error('❌ [Reminders] WhatsApp result update error:', error);
+
+    return res.status(500).json({
+      error: error.message,
+    });
   }
 });
 
