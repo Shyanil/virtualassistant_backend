@@ -261,6 +261,35 @@ function buildGoogleCalendarUrl(intent, timeZone) {
   return `https://calendar.google.com/calendar/render?${params.toString()}`;
 }
 
+async function saveVoiceLog({ userId, transcript, intent, source = 'analyze' }) {
+  const effectiveUserId = userId || 'dev-expo-anonymous';
+
+  const { data, error } = await supabase
+    .from('voice_logs')
+    .insert({
+      user_id: effectiveUserId,
+      transcript,
+      action: intent.action,
+      title: intent.title,
+      date: intent.date,
+      time: intent.time,
+      notes: intent.notes || intent.formattedText || `[${source}]`,
+      status: intent.action === 'unknown' ? 'pending' : 'done',
+    })
+    .select('id')
+    .single();
+
+  if (error) {
+    throw error;
+  }
+
+  return {
+    id: data?.id || null,
+    userId: effectiveUserId,
+    usedFallbackUserId: !userId,
+  };
+}
+
 /**
  * 🧠 Analyze Intent (Gemini)
  * Receives: { transcript: '...', userId: '...' }
@@ -269,6 +298,13 @@ app.post('/api/analyze', validateApiKey, async (req, res) => {
   try {
     const { transcript, userId, timeZone } = req.body;
     if (!transcript) return res.status(400).json({ error: 'Missing transcript' });
+    let dbResult = {
+      saved: false,
+      id: null,
+      userId: userId || 'dev-expo-anonymous',
+      usedFallbackUserId: !userId,
+      error: null,
+    };
 
     const model = selectModel(transcript);
     console.log(`🧠 [AI] Analyzing intent using ${model} for:`, transcript);
@@ -314,11 +350,8 @@ Return ONLY valid JSON:
 
     console.log('✅ [AI] Intent:', JSON.stringify(intent));
 
-    // Auto-save to Supabase if we have a userId
+    // Fetch the user profile when authenticated. Logging below still runs in dev bypass.
     if (userId) {
-      console.log('💾 [DB] Saving to Supabase for user:', userId);
-      
-      // Fetch user profile for WhatsApp number (Graceful handling if user not in users table yet)
       const { data: userData, error: profileError } = await supabase
         .from('users')
         .select('phone, full_name')
@@ -328,23 +361,34 @@ Return ONLY valid JSON:
       if (profileError) {
         console.warn('⚠️ [DB] User profile fetch error:', profileError.message);
       }
-
-      await supabase.from('voice_logs').insert({
-        user_id: userId,
-        transcript,
-        action: intent.action,
-        title: intent.title,
-        date: intent.date,
-        time: intent.time,
-        notes: intent.notes,
-        status: intent.action === 'unknown' ? 'pending' : 'done',
-      });
-
-      // ℹ️ WhatsApp confirmation is now sent ONLY after user confirms in the review screen
-      //    via POST /api/whatsapp/confirm-meeting — not here during analysis.
     }
 
-    res.json(intent);
+    try {
+      console.log(`💾 [DB] Saving voice log for user: ${userId || 'dev-expo-anonymous'}${userId ? '' : ' (fallback)'}`);
+      const savedLog = await saveVoiceLog({ userId, transcript, intent, source: 'analyze' });
+      dbResult = {
+        saved: true,
+        id: savedLog.id,
+        userId: savedLog.userId,
+        usedFallbackUserId: savedLog.usedFallbackUserId,
+        error: null,
+      };
+      console.log('✅ [DB] Voice log saved:', dbResult);
+      // ℹ️ WhatsApp confirmation is now sent ONLY after user confirms in the review screen
+      //    via POST /api/whatsapp/confirm-meeting — not here during analysis.
+    } catch (dbError) {
+      dbResult.error = dbError.message;
+      console.error('❌ [DB] Voice log save failed:', dbError);
+    }
+
+    res.json({
+      ...intent,
+      db_saved: dbResult.saved,
+      db_log_id: dbResult.id,
+      db_user_id: dbResult.userId,
+      db_used_fallback_user_id: dbResult.usedFallbackUserId,
+      db_error: dbResult.error,
+    });
   } catch (error) {
     console.error('❌ [AI] Analysis Error:', error.response?.data?.error?.message || error.message);
     res.status(500).json({ error: 'Analysis failed' });
