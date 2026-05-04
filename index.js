@@ -406,6 +406,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
   let whatsappReminderDate = null;
   let callReminderDate = null;
   let whatsappStatus = 'pending';
+  let callStatus = 'pending';
   let meetingDate = null;
 
   if (eventDate && eventTime) {
@@ -413,6 +414,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
     whatsappReminderDate = calculateReminderDate(meetingDate.toISOString(), WHATSAPP_REMINDER_LEAD_MINUTES);
     callReminderDate = calculateReminderDate(meetingDate.toISOString(), CALL_REMINDER_LEAD_MINUTES);
     whatsappStatus = whatsappReminderDate <= new Date() ? 'skipped' : 'pending';
+    callStatus = callReminderDate <= new Date() ? 'skipped' : 'pending';
   }
 
   const { data, error } = await supabase
@@ -431,7 +433,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
       whatsapp_reminder_at: whatsappReminderDate ? whatsappReminderDate.toISOString() : null,
       call_reminder_at: callReminderDate ? callReminderDate.toISOString() : null,
       whatsapp_reminder_status: whatsappStatus,
-      call_reminder_status: 'pending',
+      call_reminder_status: callStatus,
     })
     .select('*')
     .single();
@@ -1202,6 +1204,7 @@ app.patch('/api/events/:id/confirm', validateApiKey, async (req, res) => {
     const callReminderDate = calculateReminderDate(meetingDate.toISOString(), CALL_REMINDER_LEAD_MINUTES);
     const now = new Date();
     const whatsappStatus = whatsappReminderDate <= now ? 'skipped' : 'pending';
+    const callStatus = callReminderDate <= now ? 'skipped' : 'pending';
 
     const updatePayload = {
       status: 'confirmed',
@@ -1215,6 +1218,7 @@ app.patch('/api/events/:id/confirm', validateApiKey, async (req, res) => {
       whatsapp_reminder_at: whatsappReminderDate.toISOString(),
       call_reminder_at: callReminderDate.toISOString(),
       whatsapp_reminder_status: whatsappStatus,
+      call_reminder_status: callStatus,
       reminder_error: null,
     };
 
