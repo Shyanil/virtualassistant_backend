@@ -55,6 +55,16 @@ function requireN8nSharedSecret(req, res, next) {
   next();
 }
 
+function validateApiKeyOrN8nSecret(req, res, next) {
+  const configuredKey = process.env.BACKEND_API_KEY;
+  const apiKey = req.headers['x-api-key'];
+
+  if (configuredKey && apiKey === configuredKey) return next();
+  if (isSharedSecretValid(req.headers['x-shared-secret'])) return next();
+
+  return res.status(401).json({ error: 'Unauthorized' });
+}
+
 function calculateReminderDate(meetingTime, leadMinutes) {
   const meetingDate = new Date(meetingTime);
 
@@ -267,6 +277,31 @@ function buildGoogleCalendarUrl(intent, timeZone) {
   }
 
   return `https://calendar.google.com/calendar/render?${params.toString()}`;
+}
+
+function formatDisplayDate(dateString) {
+  if (!dateString) return 'TBD';
+  const date = new Date(`${dateString}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return String(dateString);
+
+  return date.toLocaleDateString('en-IN', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  });
+}
+
+function formatDisplayTime(timeString) {
+  if (!timeString) return 'TBD';
+  const normalized = String(timeString).slice(0, 5);
+  const match = normalized.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return String(timeString);
+
+  const hour24 = Number(match[1]);
+  const minute = match[2];
+  const ampm = hour24 >= 12 ? 'PM' : 'AM';
+  const hour = hour24 % 12 || 12;
+  return `${hour}:${minute} ${ampm}`;
 }
 
 function extractAttendeeName(text) {
@@ -875,6 +910,53 @@ async function sendMeetingConfirmationWA({ to, name, date, time, person, meeting
   return response.data;
 }
 
+async function sendMeetingInvitationWA({ to, name, date, time, person, meeting_link, header_image }) {
+  const authKey = process.env.MSG91_AUTH_KEY;
+  const fromNumber = process.env.MSG91_WHATSAPP_NUMBER;
+  const defaultImg = process.env.MSG91_CONFIRMATION_IMAGE;
+  const headerImg = header_image || defaultImg || '';
+
+  if (!authKey || !fromNumber) {
+    throw new Error('MSG91 credentials not configured in .env');
+  }
+
+  const payload = {
+    integrated_number: fromNumber,
+    content_type: 'template',
+    payload: {
+      messaging_product: 'whatsapp',
+      type: 'template',
+      template: {
+        name: 'meeting_invitation_notification',
+        language: { code: 'en', policy: 'deterministic' },
+        namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+        to_and_components: [{
+          to,
+          components: {
+            header_1: { type: 'image', value: headerImg },
+            body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+            body_person: { type: 'text', value: person, parameter_name: 'person' },
+            body_time: { type: 'text', value: time, parameter_name: 'time' },
+            body_name: { type: 'text', value: name, parameter_name: 'name' },
+            body_date: { type: 'text', value: date, parameter_name: 'date' },
+          }
+        }]
+      }
+    }
+  };
+
+  const response = await axios.post(
+    'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+    payload,
+    { headers: { authkey: authKey, 'Content-Type': 'application/json' } }
+  );
+
+  return {
+    msg91Response: response.data,
+    msg91Payload: payload,
+  };
+}
+
 
 // ─── WhatsApp Template: Meeting Confirmation (raw endpoint) ──────────
 /**
@@ -936,14 +1018,6 @@ app.post('/api/whatsapp/meeting-confirmation', validateApiKey, async (req, res) 
  */
 app.post('/api/whatsapp/meeting-invitation', validateApiKey, async (req, res) => {
   try {
-    const authKey     = process.env.MSG91_AUTH_KEY;
-    const fromNumber  = process.env.MSG91_WHATSAPP_NUMBER;
-    const defaultImg  = process.env.MSG91_CONFIRMATION_IMAGE;
-
-    if (!authKey || !fromNumber) {
-      return res.status(500).json({ error: 'MSG91 credentials not configured in .env' });
-    }
-
     const { to, name, date, time, person, meeting_link, header_image } = req.body;
 
     if (!to || !Array.isArray(to) || to.length === 0) {
@@ -953,47 +1027,125 @@ app.post('/api/whatsapp/meeting-invitation', validateApiKey, async (req, res) =>
       return res.status(400).json({ error: 'Missing required fields: name, date, time, person, meeting_link' });
     }
 
-    const headerImg = header_image || defaultImg || '';
-
-    const payload = {
-      integrated_number: fromNumber,
-      content_type: 'template',
-      payload: {
-        messaging_product: 'whatsapp',
-        type: 'template',
-        template: {
-          name: 'meeting_invitation_notification',
-          language: { code: 'en', policy: 'deterministic' },
-          namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
-          to_and_components: [{
-            to,
-            components: {
-              header_1:          { type: 'image', value: headerImg },
-              body_date:         { type: 'text', value: date,         parameter_name: 'date' },
-              body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
-              body_person:       { type: 'text', value: person,       parameter_name: 'person' },
-              body_name:         { type: 'text', value: name,         parameter_name: 'name' },
-              body_time:         { type: 'text', value: time,         parameter_name: 'time' },
-            }
-          }]
-        }
-      }
-    };
-
     console.log(`📲 [WhatsApp] Sending meeting-invitation to ${to.join(', ')}...`);
-
-    const response = await axios.post(
-      'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
-      payload,
-      { headers: { authkey: authKey, 'Content-Type': 'application/json' } }
-    );
-
-    console.log('✅ [WhatsApp] meeting-invitation sent:', response.data);
-    res.json({ success: true, msg91Response: response.data });
+    const result = await sendMeetingInvitationWA({ to, name, date, time, person, meeting_link, header_image });
+    console.log('✅ [WhatsApp] meeting-invitation sent:', result.msg91Response);
+    res.json({ success: true, msg91Response: result.msg91Response });
 
   } catch (err) {
     console.error('❌ [WhatsApp] meeting-invitation error:', err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+/**
+ * 📲 Send scheduled WhatsApp reminder via MSG91 invitation template.
+ *
+ * Auth:
+ * - x-api-key for manual/backend testing
+ * - x-shared-secret for n8n
+ *
+ * Body can be either:
+ * { "event_id": "uuid" }
+ *
+ * or direct:
+ * {
+ *   "to": ["918282831626", "919830753118"],
+ *   "name": "Member",
+ *   "person": "JV",
+ *   "date": "5 May 2026",
+ *   "time": "9:30 PM",
+ *   "meeting_link": "See calendar invite"
+ * }
+ */
+app.post('/api/whatsapp/send-reminder', validateApiKeyOrN8nSecret, async (req, res) => {
+  let eventId = req.body.event_id || null;
+
+  try {
+    let event = null;
+    if (eventId) {
+      const { data, error } = await supabase
+        .from('extracted_events')
+        .select('*')
+        .eq('id', eventId)
+        .single();
+
+      if (error || !data) {
+        return res.status(404).json({ success: false, error: 'Event not found' });
+      }
+
+      event = data;
+    }
+
+    const recipients = Array.isArray(req.body.to) && req.body.to.length > 0
+      ? req.body.to
+      : Array.isArray(req.body.recipient_phones) && req.body.recipient_phones.length > 0
+        ? req.body.recipient_phones
+        : [event?.user_phone, event?.attendee_phone].filter(Boolean);
+
+    const to = recipients.map(cleanPhoneNumber).filter(Boolean);
+    const name = req.body.name || 'Member';
+    const person = req.body.person || req.body.attendee_name || event?.attendee_name || 'Team';
+    const date = req.body.date || formatDisplayDate(event?.event_date);
+    const time = req.body.time || formatDisplayTime(event?.event_time);
+    const meetingLink = req.body.meeting_link || req.body.meetingLink || 'See calendar invite';
+    const headerImage = req.body.header_image;
+
+    if (!to.length) {
+      return res.status(400).json({ success: false, error: 'At least one recipient phone is required' });
+    }
+
+    if (!name || !date || !time || !person || !meetingLink) {
+      return res.status(400).json({ success: false, error: 'Missing required fields: name, date, time, person, meeting_link' });
+    }
+
+    console.log(`📲 [WhatsApp:reminder] Sending reminder to ${to.join(', ')} for event=${eventId || 'direct'}`);
+
+    const result = await sendMeetingInvitationWA({
+      to,
+      name,
+      date,
+      time,
+      person,
+      meeting_link: meetingLink,
+      header_image: headerImage,
+    });
+
+    if (eventId) {
+      await supabase
+        .from('extracted_events')
+        .update({
+          whatsapp_reminder_status: 'sent',
+          whatsapp_sent_at: new Date().toISOString(),
+          reminder_error: null,
+        })
+        .eq('id', eventId);
+    }
+
+    return res.json({
+      success: true,
+      event_id: eventId,
+      to,
+      msg91Response: result.msg91Response,
+    });
+  } catch (err) {
+    const errorMessage = err.response?.data || err.message;
+    console.error('❌ [WhatsApp:reminder] error:', errorMessage);
+
+    if (eventId) {
+      await supabase
+        .from('extracted_events')
+        .update({
+          whatsapp_reminder_status: 'failed',
+          reminder_error: typeof errorMessage === 'string' ? errorMessage : JSON.stringify(errorMessage),
+        })
+        .eq('id', eventId);
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: errorMessage,
+    });
   }
 });
 
