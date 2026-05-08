@@ -5,6 +5,7 @@ const axios = require('axios');
 const morgan = require('morgan');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const { google } = require('googleapis');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1668,6 +1669,348 @@ app.post('/api/google/create-event', validateApiKey, async (req, res) => {
   } catch (error) {
     console.error('❌ [Google] Calendar Error:', error.response?.data || error.message);
     res.status(500).json({ error: 'Failed to create calendar event', details: error.response?.data || error.message });
+  }
+});
+
+// ─── Gmail Integration (googleapis) ─────────────────────────────────
+
+function getGmailClient(accessToken) {
+  const auth = new google.auth.OAuth2();
+  auth.setCredentials({ access_token: accessToken });
+  return google.gmail({ version: 'v1', auth });
+}
+
+function decodeBase64Url(data) {
+  if (!data) return '';
+  const str = data.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = str.length % 4;
+  const padded = pad ? str + '='.repeat(4 - pad) : str;
+  try {
+    return Buffer.from(padded, 'base64').toString('utf-8');
+  } catch {
+    return '';
+  }
+}
+
+function getHeader(headers, name) {
+  const h = headers?.find(h => h.name?.toLowerCase() === name.toLowerCase());
+  return h?.value || '';
+}
+
+function getMessageBody(payload) {
+  if (!payload) return '';
+  let body = '';
+  if (payload.parts) {
+    const plainPart = payload.parts.find(p => p.mimeType === 'text/plain');
+    const htmlPart = payload.parts.find(p => p.mimeType === 'text/html');
+    if (plainPart?.body?.data) {
+      body = decodeBase64Url(plainPart.body.data);
+    } else if (htmlPart?.body?.data) {
+      body = decodeBase64Url(htmlPart.body.data);
+    }
+    if (!body) {
+      for (const part of payload.parts) {
+        if (part.parts) {
+          const nested = getMessageBody(part);
+          if (nested) { body = nested; break; }
+        }
+      }
+    }
+  } else if (payload.body?.data) {
+    body = decodeBase64Url(payload.body.data);
+  }
+  if (body.includes('<') && body.includes('>')) {
+    body = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  return body;
+}
+
+/**
+ * 🔗 Connect Gmail Account
+ * POST /api/gmail/connect
+ */
+app.post('/api/gmail/connect', validateApiKey, async (req, res) => {
+  try {
+    const { userId, accessToken, refreshToken, email, expiresAt } = req.body;
+    if (!userId || !accessToken || !email) {
+      return res.status(400).json({ error: 'Missing userId, accessToken, or email' });
+    }
+
+    const { error } = await supabase
+      .from('gmail_accounts')
+      .upsert({
+        user_id: userId,
+        gmail_email: email,
+        access_token: accessToken,
+        refresh_token: refreshToken || null,
+        expires_at: expiresAt || null,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'user_id' });
+
+    if (error) {
+      console.error('❌ [Gmail] DB error:', error);
+      return res.status(500).json({ error: 'Failed to save Gmail account' });
+    }
+
+    console.log(`✅ [Gmail] Connected: ${email} for user ${userId}`);
+    res.json({ success: true, email });
+  } catch (err) {
+    console.error('❌ [Gmail] Connect error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * 📥 Fetch Inbox
+ * GET /api/gmail/inbox?userId=...&days=7|15|30
+ */
+app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
+  try {
+    const { userId, days } = req.query;
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+    const { data: account, error: dbError } = await supabase
+      .from('gmail_accounts')
+      .select('access_token, gmail_email')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (dbError || !account) {
+      return res.status(404).json({ error: 'Gmail account not connected' });
+    }
+
+    const dayCount = Math.min(Math.max(Number(days) || 7, 1), 30);
+    const gmail = getGmailClient(account.access_token);
+
+    const listRes = await gmail.users.messages.list({
+      userId: 'me',
+      q: `category:primary newer_than:${dayCount}d`,
+      maxResults: 50,
+    });
+
+    const messages = listRes.data.messages || [];
+    if (messages.length === 0) {
+      return res.json({ emails: [], account: account.gmail_email });
+    }
+
+    const emails = await Promise.all(
+      messages.slice(0, 30).map(async (msg) => {
+        try {
+          const detail = await gmail.users.messages.get({
+            userId: 'me',
+            id: msg.id,
+            format: 'metadata',
+            metadataHeaders: ['From', 'Subject', 'Date'],
+          });
+
+          const headers = detail.data.payload?.headers || [];
+          const from = getHeader(headers, 'From');
+          const subject = getHeader(headers, 'Subject');
+          const date = getHeader(headers, 'Date');
+
+          const senderMatch = from.match(/^"?([^"]+)"?\s*<(.+)>$/);
+          const senderName = senderMatch ? senderMatch[1].trim() : from.split('@')[0];
+          const senderEmail = senderMatch ? senderMatch[2].trim() : from;
+
+          return {
+            id: msg.id,
+            threadId: msg.threadId,
+            subject: subject || '(no subject)',
+            senderName: senderName || 'Unknown',
+            senderEmail: senderEmail || '',
+            date,
+            snippet: detail.data.snippet || '',
+            unread: detail.data.labelIds?.includes('UNREAD') || false,
+          };
+        } catch (e) {
+          console.warn(`⚠️ [Gmail] Failed to fetch message ${msg.id}:`, e.message);
+          return null;
+        }
+      })
+    );
+
+    res.json({
+      emails: emails.filter(Boolean),
+      account: account.gmail_email,
+    });
+  } catch (err) {
+    console.error('❌ [Gmail] Inbox error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * 📧 Fetch Message Detail
+ * GET /api/gmail/message/:id?userId=...
+ */
+app.get('/api/gmail/message/:id', validateApiKey, async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const messageId = req.params.id;
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+    const { data: account, error: dbError } = await supabase
+      .from('gmail_accounts')
+      .select('access_token')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (dbError || !account) {
+      return res.status(404).json({ error: 'Gmail account not connected' });
+    }
+
+    const gmail = getGmailClient(account.access_token);
+
+    const detail = await gmail.users.messages.get({
+      userId: 'me',
+      id: messageId,
+      format: 'full',
+    });
+
+    const headers = detail.data.payload?.headers || [];
+    const from = getHeader(headers, 'From');
+    const to = getHeader(headers, 'To');
+    const subject = getHeader(headers, 'Subject');
+    const date = getHeader(headers, 'Date');
+    const body = getMessageBody(detail.data.payload);
+
+    let threadMessages = [];
+    if (detail.data.threadId) {
+      try {
+        const thread = await gmail.users.threads.get({
+          userId: 'me',
+          id: detail.data.threadId,
+        });
+        threadMessages = (thread.data.messages || []).map(m => ({
+          id: m.id,
+          from: getHeader(m.payload?.headers, 'From'),
+          date: getHeader(m.payload?.headers, 'Date'),
+          body: getMessageBody(m.payload),
+          snippet: m.snippet,
+        }));
+      } catch (e) {
+        console.warn('⚠️ [Gmail] Thread fetch failed:', e.message);
+      }
+    }
+
+    res.json({
+      id: messageId,
+      threadId: detail.data.threadId,
+      subject: subject || '(no subject)',
+      from,
+      to,
+      date,
+      body: body || detail.data.snippet || '',
+      snippet: detail.data.snippet,
+      threadMessages: threadMessages.length > 0 ? threadMessages : [{
+        id: messageId,
+        from,
+        date,
+        body: body || detail.data.snippet || '',
+        snippet: detail.data.snippet,
+      }],
+    });
+  } catch (err) {
+    console.error('❌ [Gmail] Message error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * 🤖 Generate AI Reply
+ * POST /api/gmail/generate-reply
+ */
+app.post('/api/gmail/generate-reply', validateApiKey, async (req, res) => {
+  try {
+    const { emailBody, subject, senderName, tone } = req.body;
+    if (!emailBody) return res.status(400).json({ error: 'Missing emailBody' });
+
+    const prompt = `You are a professional email assistant. Draft a concise, professional reply to this email.
+
+Context:
+- Subject: ${subject || 'N/A'}
+- From: ${senderName || 'Sender'}
+- Tone: ${tone || 'professional and friendly'}
+
+Original email:
+"""
+${emailBody}
+"""
+
+Instructions:
+1. Write a reply that directly addresses the email content
+2. Keep it concise (2-4 sentences unless complex)
+3. Be warm but professional
+4. Do NOT include subject line or signatures
+5. Return ONLY the reply text, no explanations
+
+Draft reply:`;
+
+    const model = selectModel(emailBody);
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.3, maxOutputTokens: 500 },
+      }
+    );
+
+    const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 'I could not generate a reply.';
+
+    res.json({ reply });
+  } catch (err) {
+    console.error('❌ [Gmail] Generate reply error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * 📤 Send Email
+ * POST /api/gmail/send
+ */
+app.post('/api/gmail/send', validateApiKey, async (req, res) => {
+  try {
+    const { userId, to, subject, body, threadId } = req.body;
+    if (!userId || !to || !subject || !body) {
+      return res.status(400).json({ error: 'Missing required fields: userId, to, subject, body' });
+    }
+
+    const { data: account, error: dbError } = await supabase
+      .from('gmail_accounts')
+      .select('access_token')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (dbError || !account) {
+      return res.status(404).json({ error: 'Gmail account not connected' });
+    }
+
+    const gmail = getGmailClient(account.access_token);
+
+    const messageParts = [
+      `To: ${to}`,
+      `Subject: ${subject}`,
+      'Content-Type: text/plain; charset=utf-8',
+      'MIME-Version: 1.0',
+      '',
+      body,
+    ];
+    const raw = Buffer.from(messageParts.join('\n')).toString('base64url');
+
+    const sendRes = await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: { raw, threadId: threadId || undefined },
+    });
+
+    console.log(`✅ [Gmail] Sent message: ${sendRes.data.id}`);
+    res.json({
+      success: true,
+      messageId: sendRes.data.id,
+      threadId: sendRes.data.threadId,
+    });
+  } catch (err) {
+    console.error('❌ [Gmail] Send error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
