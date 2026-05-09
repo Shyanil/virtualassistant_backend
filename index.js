@@ -1732,6 +1732,30 @@ function getMessageBody(payload) {
 }
 
 /**
+ * 🔗 OAuth Callback Proxy for Expo Go
+ * GET /api/gmail/oauth-callback?code=...&state=...&app_return_url=...
+ *
+ * Google redirects here after user consents. We immediately redirect
+ * back to the mobile app so it can exchange the code for a token.
+ */
+app.get('/api/gmail/oauth-callback', (req, res) => {
+  const { code, state, app_return_url } = req.query;
+
+  if (!app_return_url) {
+    return res.status(400).send('Missing app_return_url');
+  }
+
+  try {
+    const redirectUrl = new URL(app_return_url);
+    if (code) redirectUrl.searchParams.set('code', code);
+    if (state) redirectUrl.searchParams.set('state', state);
+    res.redirect(redirectUrl.toString());
+  } catch (e) {
+    res.status(400).send('Invalid app_return_url');
+  }
+});
+
+/**
  * 🔗 Connect Gmail Account
  * POST /api/gmail/connect
  */
