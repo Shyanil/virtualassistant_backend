@@ -33,6 +33,12 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
+// Admin client for server-side operations bypassing RLS (e.g. gmail_accounts)
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY
+);
+
 const WHATSAPP_REMINDER_LEAD_MINUTES = 20;
 const CALL_REMINDER_LEAD_MINUTES = 5;
 const DEFAULT_TEST_USER_PHONE = process.env.DEFAULT_TEST_USER_PHONE || '918282831626';
@@ -1736,7 +1742,7 @@ app.post('/api/gmail/connect', validateApiKey, async (req, res) => {
       return res.status(400).json({ error: 'Missing userId, accessToken, or email' });
     }
 
-    const { error } = await supabase
+    const { error } = await supabaseAdmin
       .from('gmail_accounts')
       .upsert({
         user_id: userId,
@@ -1748,8 +1754,8 @@ app.post('/api/gmail/connect', validateApiKey, async (req, res) => {
       }, { onConflict: 'user_id' });
 
     if (error) {
-      console.error('❌ [Gmail] DB error:', error);
-      return res.status(500).json({ error: 'Failed to save Gmail account' });
+      console.error('❌ [Gmail] DB error:', error.message, error.details, error.hint);
+      return res.status(500).json({ error: 'Failed to save Gmail account', details: error.message });
     }
 
     console.log(`✅ [Gmail] Connected: ${email} for user ${userId}`);
@@ -1761,15 +1767,54 @@ app.post('/api/gmail/connect', validateApiKey, async (req, res) => {
 });
 
 /**
- * 📥 Fetch Inbox
+ * 📥 Fetch Inbox — returns only emails that likely need a reply
  * GET /api/gmail/inbox?userId=...&days=7|15|30
  */
+
+const AUTO_SENDER_PATTERNS = [
+  'no-reply', 'noreply', 'donotreply', 'notifications', 'notification',
+  'alerts', 'alert', 'digest', 'newsletter', 'marketing', 'mailer-daemon',
+  'bounce', 'support', 'help', 'team', 'info', 'admin', 'billing',
+  'updates', 'status', 'github', 'linkedin', 'twitter', 'facebook',
+  'instagram', 'youtube', 'netflix', 'spotify', 'amazon', 'flipkart',
+  'swiggy', 'zomato', 'uber', 'ola', 'paytm', 'phonepe', 'razorpay',
+];
+
+const AUTO_SUBJECT_PATTERNS = [
+  'unsubscribe', 'digest', 'newsletter', 'your order', 'shipment',
+  'invoice', 'receipt', 'password reset', 'verification', 'otp',
+  'reset your', 'confirm your', 'welcome to', 'thanks for signing',
+  'account alert', 'security alert', 'login attempt', 'delivery',
+  'tracking', 'payment received', 'statement', 'summary', 'weekly',
+  'monthly', 'daily digest', 'promotion', 'sale', 'offer', 'deal',
+  'order confirmed', 'order shipped', 'subscription', 'reminder:',
+];
+
+function isAutoEmail(fromEmail, fromName, subject, labels) {
+  const emailLower = (fromEmail || '').toLowerCase();
+  const nameLower = (fromName || '').toLowerCase();
+  const subjectLower = (subject || '').toLowerCase();
+
+  for (const p of AUTO_SENDER_PATTERNS) {
+    if (emailLower.includes(p) || nameLower.includes(p)) return true;
+  }
+  for (const p of AUTO_SUBJECT_PATTERNS) {
+    if (subjectLower.includes(p)) return true;
+  }
+  if (Array.isArray(labels)) {
+    if (labels.includes('CATEGORY_PROMOTIONS')) return true;
+    if (labels.includes('CATEGORY_SOCIAL')) return true;
+    if (labels.includes('CATEGORY_FORUMS')) return true;
+  }
+  return false;
+}
+
 app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
   try {
     const { userId, days } = req.query;
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
-    const { data: account, error: dbError } = await supabase
+    const { data: account, error: dbError } = await supabaseAdmin
       .from('gmail_accounts')
       .select('access_token, gmail_email')
       .eq('user_id', userId)
@@ -1781,11 +1826,13 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
 
     const dayCount = Math.min(Math.max(Number(days) || 7, 1), 30);
     const gmail = getGmailClient(account.access_token);
+    const userEmail = account.gmail_email?.toLowerCase() || '';
 
+    // Broader search with exclusions (not just primary)
     const listRes = await gmail.users.messages.list({
       userId: 'me',
-      q: `category:primary newer_than:${dayCount}d`,
-      maxResults: 50,
+      q: `newer_than:${dayCount}d -category:promotions -category:social -category:forums`,
+      maxResults: 60,
     });
 
     const messages = listRes.data.messages || [];
@@ -1793,20 +1840,23 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
       return res.json({ emails: [], account: account.gmail_email });
     }
 
-    const emails = await Promise.all(
-      messages.slice(0, 30).map(async (msg) => {
+    // Fetch metadata for all messages
+    const candidates = await Promise.all(
+      messages.map(async (msg) => {
         try {
           const detail = await gmail.users.messages.get({
             userId: 'me',
             id: msg.id,
             format: 'metadata',
-            metadataHeaders: ['From', 'Subject', 'Date'],
+            metadataHeaders: ['From', 'Subject', 'Date', 'To'],
           });
 
           const headers = detail.data.payload?.headers || [];
           const from = getHeader(headers, 'From');
+          const to = getHeader(headers, 'To');
           const subject = getHeader(headers, 'Subject');
           const date = getHeader(headers, 'Date');
+          const labels = detail.data.labelIds || [];
 
           const senderMatch = from.match(/^"?([^"]+)"?\s*<(.+)>$/);
           const senderName = senderMatch ? senderMatch[1].trim() : from.split('@')[0];
@@ -1820,7 +1870,9 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
             senderEmail: senderEmail || '',
             date,
             snippet: detail.data.snippet || '',
-            unread: detail.data.labelIds?.includes('UNREAD') || false,
+            unread: labels.includes('UNREAD'),
+            labels,
+            to,
           };
         } catch (e) {
           console.warn(`⚠️ [Gmail] Failed to fetch message ${msg.id}:`, e.message);
@@ -1829,8 +1881,52 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
       })
     );
 
+    // Filter 1: Remove nulls and auto-generated emails
+    let filtered = candidates.filter((e) => {
+      if (!e) return false;
+      if (isAutoEmail(e.senderEmail, e.senderName, e.subject, e.labels)) return false;
+      return true;
+    });
+
+    // Filter 2: For each thread, if the LAST message is from the user, skip it
+    const needsReply = [];
+    await Promise.all(
+      filtered.map(async (email) => {
+        try {
+          const thread = await gmail.users.threads.get({
+            userId: 'me',
+            id: email.threadId,
+          });
+
+          const threadMessages = thread.data.messages || [];
+          if (threadMessages.length === 0) {
+            needsReply.push(email);
+            return;
+          }
+
+          const lastMsg = threadMessages[threadMessages.length - 1];
+          const lastHeaders = lastMsg.payload?.headers || [];
+          const lastFrom = getHeader(lastHeaders, 'From').toLowerCase();
+
+          // If last message is from user, they already replied / sent it
+          if (lastFrom.includes(userEmail)) return;
+
+          needsReply.push({
+            ...email,
+            replyReason: 'Waiting for your reply',
+          });
+        } catch (e) {
+          // Thread fetch failed — include conservatively
+          needsReply.push(email);
+        }
+      })
+    );
+
+    // Sort by date desc
+    needsReply.sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+
     res.json({
-      emails: emails.filter(Boolean),
+      emails: needsReply.slice(0, 30),
       account: account.gmail_email,
     });
   } catch (err) {
@@ -1849,7 +1945,7 @@ app.get('/api/gmail/message/:id', validateApiKey, async (req, res) => {
     const messageId = req.params.id;
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
-    const { data: account, error: dbError } = await supabase
+    const { data: account, error: dbError } = await supabaseAdmin
       .from('gmail_accounts')
       .select('access_token')
       .eq('user_id', userId)
@@ -1975,7 +2071,7 @@ app.post('/api/gmail/send', validateApiKey, async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields: userId, to, subject, body' });
     }
 
-    const { data: account, error: dbError } = await supabase
+    const { data: account, error: dbError } = await supabaseAdmin
       .from('gmail_accounts')
       .select('access_token')
       .eq('user_id', userId)
