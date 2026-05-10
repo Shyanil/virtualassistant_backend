@@ -577,7 +577,9 @@ Return ONLY valid JSON:
   "date": "YYYY-MM-DD",
   "time": "HH:MM",
   "durationMinutes": 60,
-  "notes": "short context for the calendar description",
+  "location": "meeting location — default to 'Google Meet' if not specified by user",
+  "attendees": ["name or email of attendee if mentioned"],
+  "notes": "short context for the calendar description — include any details the user mentioned",
   "formattedText": "clean, easy-to-understand summary with key details"
 }`;
 
@@ -1621,11 +1623,11 @@ app.post('/api/reminders/whatsapp-result', requireN8nSharedSecret, async (req, r
 
 /**
  * 📅 Create Google Calendar Event
- * Receives: { accessToken, title, description, date, time, durationMinutes, timeZone }
+ * Receives: { accessToken, title, description, date, time, durationMinutes, timeZone, location }
  */
 app.post('/api/google/create-event', validateApiKey, async (req, res) => {
   try {
-    const { accessToken, title, description, date, time, durationMinutes, timeZone } = req.body;
+    const { accessToken, title, description, date, time, durationMinutes, timeZone, location } = req.body;
     
     if (!accessToken) return res.status(400).json({ error: 'Missing Google access token' });
     if (!title || !date || !time) return res.status(400).json({ error: 'Missing event details' });
@@ -1639,6 +1641,7 @@ app.post('/api/google/create-event', validateApiKey, async (req, res) => {
     const event = {
       summary: title,
       description: description || 'Created via Adamslave',
+      location: location || undefined,
       start: {
         dateTime: startTime.toISOString(),
         timeZone: timeZone || 'UTC',
@@ -2145,7 +2148,7 @@ app.get('/api/gmail/message/:id', validateApiKey, async (req, res) => {
  */
 app.post('/api/gmail/generate-reply', validateApiKey, async (req, res) => {
   try {
-    const { emailBody, subject, senderName, tone } = req.body;
+    const { emailBody, subject, senderName, tone, userName } = req.body;
     if (!emailBody) return res.status(400).json({ error: 'Missing emailBody' });
 
     const prompt = `You are a professional email assistant. Draft a concise, professional reply to this email.
@@ -2154,6 +2157,7 @@ Context:
 - Subject: ${subject || 'N/A'}
 - From: ${senderName || 'Sender'}
 - Tone: ${tone || 'professional and friendly'}
+- Your name: ${userName || 'Me'}
 
 Original email:
 """
@@ -2164,8 +2168,10 @@ Instructions:
 1. Write a reply that directly addresses the email content
 2. Keep it concise (2-4 sentences unless complex)
 3. Be warm but professional
-4. Do NOT include subject line or signatures
-5. Return ONLY the reply text, no explanations
+4. Sign off with the user's first name: "${userName ? userName.split(' ')[0] : 'Best'}"
+5. Do NOT include calendar invite links, meeting URLs, or video call links in the reply text. Those are shared separately.
+6. Do NOT include subject line or formal signatures
+7. Return ONLY the reply text, no explanations
 
 Draft reply:`;
 
