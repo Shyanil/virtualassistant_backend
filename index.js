@@ -1731,27 +1731,55 @@ function getMessageBody(payload) {
   return body;
 }
 
+function getGmailAppReturnUrl(state, appReturnUrl) {
+  if (appReturnUrl) return appReturnUrl;
+
+  if (!state) return null;
+
+  try {
+    const parsedState = JSON.parse(state);
+    return parsedState.appReturnUrl || null;
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedGmailReturnUrl(returnUrl) {
+  try {
+    const parsedUrl = new URL(returnUrl);
+    return ['exp:', 'exps:', 'mobile:'].includes(parsedUrl.protocol);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 🔗 OAuth Callback Proxy for Expo Go
- * GET /api/gmail/oauth-callback?code=...&state=...&app_return_url=...
+ * GET /api/gmail/oauth-callback?code=...&state=...
  *
  * Google redirects here after user consents. We immediately redirect
  * back to the mobile app so it can exchange the code for a token.
  */
 app.get('/api/gmail/oauth-callback', (req, res) => {
-  const { code, state, app_return_url } = req.query;
+  const { code, state, error, app_return_url } = req.query;
+  const appReturnUrl = getGmailAppReturnUrl(state, app_return_url);
 
-  if (!app_return_url) {
-    return res.status(400).send('Missing app_return_url');
+  if (!appReturnUrl) {
+    return res.status(400).send('Missing app return URL');
+  }
+
+  if (!isAllowedGmailReturnUrl(appReturnUrl)) {
+    return res.status(400).send('Invalid app return URL');
   }
 
   try {
-    const redirectUrl = new URL(app_return_url);
+    const redirectUrl = new URL(appReturnUrl);
     if (code) redirectUrl.searchParams.set('code', code);
     if (state) redirectUrl.searchParams.set('state', state);
+    if (error) redirectUrl.searchParams.set('error', error);
     res.redirect(redirectUrl.toString());
   } catch (e) {
-    res.status(400).send('Invalid app_return_url');
+    res.status(400).send('Invalid app return URL');
   }
 });
 
