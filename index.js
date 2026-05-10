@@ -34,9 +34,13 @@ const supabase = createClient(
 );
 
 // Admin client for server-side operations bypassing RLS (e.g. gmail_accounts)
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE;
+if (!supabaseServiceKey) {
+  console.warn('⚠️ [Config] SUPABASE_SERVICE_ROLE_KEY / SUPABASE_SERVICE_ROLE not found. supabaseAdmin will fall back to SUPABASE_ANON_KEY and RLS policies will block server-side inserts/updates.');
+}
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY
+  supabaseServiceKey || process.env.SUPABASE_ANON_KEY
 );
 
 const WHATSAPP_REMINDER_LEAD_MINUTES = 20;
