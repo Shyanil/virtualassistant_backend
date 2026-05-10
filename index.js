@@ -1848,6 +1848,7 @@ app.post('/api/gmail/exchange-code', async (req, res) => {
     res.json({
       accessToken: tokenData.access_token,
       refreshToken: tokenData.refresh_token || null,
+      idToken: tokenData.id_token || null,
       email,
       expiresIn: tokenData.expires_in,
     });
