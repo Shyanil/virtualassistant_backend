@@ -1784,6 +1784,76 @@ app.get('/api/gmail/oauth-callback', (req, res) => {
 });
 
 /**
+ * 🔄 Exchange OAuth Code for Tokens (secure — client_secret stays on server)
+ * POST /api/gmail/exchange-code
+ */
+app.post('/api/gmail/exchange-code', async (req, res) => {
+  try {
+    const { code, redirectUri, codeVerifier } = req.body;
+    if (!code || !redirectUri) {
+      return res.status(400).json({ error: 'Missing code or redirectUri' });
+    }
+
+    const clientId = process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+      return res.status(500).json({ error: 'Server is missing Google OAuth credentials' });
+    }
+
+    const params = new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      code,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+    });
+
+    if (codeVerifier) {
+      params.set('code_verifier', codeVerifier);
+    }
+
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+
+    const tokenData = await tokenRes.json();
+
+    if (!tokenRes.ok || tokenData.error) {
+      console.error('❌ [Gmail] Token exchange failed:', tokenData);
+      return res.status(400).json({
+        error: tokenData.error || 'Token exchange failed',
+        description: tokenData.error_description || '',
+      });
+    }
+
+    // Fetch user email
+    let email = '';
+    try {
+      const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
+      });
+      const userData = await userRes.json();
+      email = userData.email || '';
+    } catch (e) {
+      console.warn('[Gmail] Could not fetch userinfo:', e.message);
+    }
+
+    res.json({
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token || null,
+      email,
+      expiresIn: tokenData.expires_in,
+    });
+  } catch (err) {
+    console.error('❌ [Gmail] Exchange-code error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * 🔗 Connect Gmail Account
  * POST /api/gmail/connect
  */
