@@ -2084,7 +2084,9 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
           const from = getHeader(headers, 'From');
           const to = getHeader(headers, 'To');
           const subject = getHeader(headers, 'Subject');
-          const date = getHeader(headers, 'Date');
+          const headerDate = getHeader(headers, 'Date');
+          const internalTimestamp = Number(detail.data.internalDate || 0);
+          const date = headerDate || (internalTimestamp ? new Date(internalTimestamp).toISOString() : '');
           const labels = detail.data.labelIds || [];
 
           const senderMatch = from.match(/^"?([^"]+)"?\s*<(.+)>$/);
@@ -2098,6 +2100,7 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
             senderName: senderName || 'Unknown',
             senderEmail: senderEmail || '',
             date,
+            internalDate: internalTimestamp,
             snippet: detail.data.snippet || '',
             unread: labels.includes('UNREAD'),
             labels,
@@ -2113,8 +2116,8 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
     // Filter 1: Remove nulls and auto-generated emails
     let filtered = candidates.filter((e) => {
       if (!e) return false;
-      const receivedAt = new Date(e.date || 0);
-      if (Number.isNaN(receivedAt.getTime()) || receivedAt < cutoff) return false;
+      const receivedAtMs = e.internalDate || new Date(e.date || 0).getTime();
+      if (!receivedAtMs || Number.isNaN(receivedAtMs) || receivedAtMs < cutoff.getTime()) return false;
       if (!Array.isArray(e.labels) || !e.labels.includes('INBOX')) return false;
       if (e.labels.includes('SPAM') || e.labels.includes('TRASH') || e.labels.includes('DRAFT') || e.labels.includes('SENT')) return false;
       if (e.senderEmail && userEmail && e.senderEmail === userEmail) return false;
@@ -2164,7 +2167,7 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
     );
 
     // Sort by date desc
-    inboxItems.sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+    inboxItems.sort((a, b) => (b.internalDate || new Date(b.date || 0).getTime()) - (a.internalDate || new Date(a.date || 0).getTime()));
 
     res.json({
       emails: inboxItems.slice(0, mode === 'all' ? 50 : 30),
