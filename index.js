@@ -1710,6 +1710,68 @@ function getHeader(headers, name) {
   return h?.value || '';
 }
 
+function htmlToReadableText(html) {
+  let text = decodeHtmlEntities(String(html || ''));
+
+  for (let i = 0; i < 3; i += 1) {
+    text = stripHtmlTemplateNoise(text);
+    text = decodeHtmlEntities(text);
+  }
+
+  return text
+    .split('\n')
+    .map(line => line.replace(/\s+/g, ' ').trim())
+    .filter(line => line && !isTemplateCodeLine(line))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&rsquo;|&lsquo;/gi, "'")
+    .replace(/&rdquo;|&ldquo;/gi, '"')
+    .replace(/&ndash;|&mdash;/gi, '-')
+    .replace(/&#(\d+);/g, (_, code) => {
+      const valueCode = Number(code);
+      return Number.isFinite(valueCode) ? String.fromCharCode(valueCode) : ' ';
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => {
+      const valueCode = parseInt(code, 16);
+      return Number.isFinite(valueCode) ? String.fromCharCode(valueCode) : ' ';
+    });
+}
+
+function stripHtmlTemplateNoise(value) {
+  return String(value || '')
+    .replace(/<!doctype[\s\S]*?>/gi, ' ')
+    .replace(/<head[\s\S]*?<\/head>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<img\b[^>]*>/gi, ' ')
+    .replace(/<(br|\/p|\/div|\/li|\/tr|\/td|\/th|h[1-6])\b[^>]*>/gi, '\n')
+    .replace(/<li\b[^>]*>/gi, '\n- ')
+    .replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, '$2')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\{[^{}]{0,500}\}/g, ' ')
+    .replace(/\b(?:font-family|font-size|line-height|padding|margin|border|color|background|width|height|display|text-align|border-radius|box-sizing)\s*:\s*[^;]+;/gi, ' ')
+    .replace(/https?:\/\/\S{80,}/gi, ' ');
+}
+
+function isTemplateCodeLine(line) {
+  if (/[<>]/.test(line)) return true;
+  if (/(doctype|html|body|table|tbody|thead|tr|td|font-family|border-collapse|mso-|webkit|@media|class=|style=)/i.test(line)) return true;
+  const codeChars = (line.match(/[{};=<>]/g) || []).length;
+  return line.length > 40 && codeChars / line.length > 0.08 && !/[?.!,]/.test(line);
+}
+
 function getMessageBody(payload) {
   if (!payload) return '';
   let body = '';
@@ -1733,7 +1795,9 @@ function getMessageBody(payload) {
     body = decodeBase64Url(payload.body.data);
   }
   if (body.includes('<') && body.includes('>')) {
-    body = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    body = htmlToReadableText(body);
+  } else {
+    body = body.replace(/\s+/g, ' ').trim();
   }
   return body;
 }
@@ -1920,6 +1984,15 @@ const AUTO_SUBJECT_PATTERNS = [
   'order confirmed', 'order shipped', 'subscription', 'reminder:',
 ];
 
+const REPLY_REQUEST_PATTERNS = [
+  'please reply', 'please respond', 'waiting for your reply', 'awaiting your reply',
+  'waiting for your response', 'awaiting your response', 'let me know',
+  'please let me know', 'can you', 'could you', 'would you', 'are you available',
+  'available for', 'confirm', 'please confirm', 'approve', 'approval',
+  'your thoughts', 'what do you think', 'feedback', 'review this', 'need your',
+  'need you to', 'follow up', 'schedule', 'meeting', 'call', 'question',
+];
+
 function isAutoEmail(fromEmail, fromName, subject, labels) {
   const emailLower = (fromEmail || '').toLowerCase();
   const nameLower = (fromName || '').toLowerCase();
@@ -1939,9 +2012,22 @@ function isAutoEmail(fromEmail, fromName, subject, labels) {
   return false;
 }
 
+function parseEmailAddress(value) {
+  return String(value || '').match(/<([^>]+)>/)?.[1]?.trim().toLowerCase() || String(value || '').trim().toLowerCase();
+}
+
+function looksLikeReplyRequest(email) {
+  const subject = String(email.subject || '').toLowerCase();
+  const snippet = String(email.snippet || '').toLowerCase();
+  const text = `${subject} ${snippet}`;
+  if (text.includes('?')) return true;
+  return REPLY_REQUEST_PATTERNS.some((pattern) => text.includes(pattern));
+}
+
 app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
   try {
     const { userId, days } = req.query;
+    const mode = req.query.mode === 'all' ? 'all' : 'important';
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
     const { data: account, error: dbError } = await supabaseAdmin
@@ -1955,17 +2041,30 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
     }
 
     const dayCount = Math.min(Math.max(Number(days) || 7, 1), 30);
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - dayCount);
+    cutoff.setHours(0, 0, 0, 0);
+    const gmailAfter = `${cutoff.getFullYear()}/${String(cutoff.getMonth() + 1).padStart(2, '0')}/${String(cutoff.getDate()).padStart(2, '0')}`;
     const gmail = getGmailClient(account.access_token);
     const userEmail = account.gmail_email?.toLowerCase() || '';
 
-    // Broader search with exclusions (not just primary)
-    const listRes = await gmail.users.messages.list({
-      userId: 'me',
-      q: `newer_than:${dayCount}d -category:promotions -category:social -category:forums`,
-      maxResults: 60,
-    });
+    // Search the full inbox across Primary, Promotions, Social, Updates, and Forums.
+    const messages = [];
+    let pageToken;
+    const maxMessages = mode === 'all' ? 200 : 160;
 
-    const messages = listRes.data.messages || [];
+    do {
+      const listRes = await gmail.users.messages.list({
+        userId: 'me',
+        q: `in:inbox after:${gmailAfter} -in:spam -in:trash`,
+        maxResults: Math.min(100, maxMessages - messages.length),
+        pageToken,
+      });
+
+      messages.push(...(listRes.data.messages || []));
+      pageToken = listRes.data.nextPageToken;
+    } while (pageToken && messages.length < maxMessages);
+
     if (messages.length === 0) {
       return res.json({ emails: [], account: account.gmail_email });
     }
@@ -1990,7 +2089,7 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
 
           const senderMatch = from.match(/^"?([^"]+)"?\s*<(.+)>$/);
           const senderName = senderMatch ? senderMatch[1].trim() : from.split('@')[0];
-          const senderEmail = senderMatch ? senderMatch[2].trim() : from;
+          const senderEmail = parseEmailAddress(senderMatch ? senderMatch[2] : from);
 
           return {
             id: msg.id,
@@ -2014,12 +2113,16 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
     // Filter 1: Remove nulls and auto-generated emails
     let filtered = candidates.filter((e) => {
       if (!e) return false;
-      if (isAutoEmail(e.senderEmail, e.senderName, e.subject, e.labels)) return false;
+      const receivedAt = new Date(e.date || 0);
+      if (Number.isNaN(receivedAt.getTime()) || receivedAt < cutoff) return false;
+      if (!Array.isArray(e.labels) || !e.labels.includes('INBOX')) return false;
+      if (e.labels.includes('SPAM') || e.labels.includes('TRASH') || e.labels.includes('DRAFT') || e.labels.includes('SENT')) return false;
+      if (e.senderEmail && userEmail && e.senderEmail === userEmail) return false;
       return true;
     });
 
-    // Filter 2: For each thread, if the LAST message is from the user, skip it
-    const needsReply = [];
+    // Filter 2: For each thread, mark whether the last message needs the user's reply.
+    const inboxItems = [];
     await Promise.all(
       filtered.map(async (email) => {
         try {
@@ -2030,7 +2133,7 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
 
           const threadMessages = thread.data.messages || [];
           if (threadMessages.length === 0) {
-            needsReply.push(email);
+            if (mode === 'all') inboxItems.push({ ...email, replyNeeded: false });
             return;
           }
 
@@ -2038,25 +2141,33 @@ app.get('/api/gmail/inbox', validateApiKey, async (req, res) => {
           const lastHeaders = lastMsg.payload?.headers || [];
           const lastFrom = getHeader(lastHeaders, 'From').toLowerCase();
 
-          // If last message is from user, they already replied / sent it
-          if (lastFrom.includes(userEmail)) return;
+          const lastMessageIsFromUser = userEmail && lastFrom.includes(userEmail);
+          const replyRequested = looksLikeReplyRequest(email);
+          const isBulk = isAutoEmail(email.senderEmail, email.senderName, email.subject, email.labels);
+          const replyNeeded = !lastMessageIsFromUser && replyRequested && !isBulk;
 
-          needsReply.push({
+          if (mode === 'important' && !replyNeeded) return;
+
+          inboxItems.push({
             ...email,
-            replyReason: 'Waiting for your reply',
+            replyNeeded,
+            replyReason: replyNeeded ? 'Waiting for your reply' : null,
           });
         } catch (e) {
-          // Thread fetch failed — include conservatively
-          needsReply.push(email);
+          if (mode === 'all') {
+            inboxItems.push({ ...email, replyNeeded: false });
+          } else if (looksLikeReplyRequest(email)) {
+            inboxItems.push({ ...email, replyNeeded: true, replyReason: 'Waiting for your reply' });
+          }
         }
       })
     );
 
     // Sort by date desc
-    needsReply.sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+    inboxItems.sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
 
     res.json({
-      emails: needsReply.slice(0, 30),
+      emails: inboxItems.slice(0, mode === 'all' ? 50 : 30),
       account: account.gmail_email,
     });
   } catch (err) {
@@ -2151,13 +2262,14 @@ app.post('/api/gmail/generate-reply', validateApiKey, async (req, res) => {
     const { emailBody, subject, senderName, tone, userName } = req.body;
     if (!emailBody) return res.status(400).json({ error: 'Missing emailBody' });
 
-    const prompt = `You are a professional email assistant. Draft a concise, professional reply to this email.
+    const fullName = userName || 'Shyanil Mishra';
+    const prompt = `You are a professional email assistant. Draft a polished, professional reply to this email.
 
 Context:
 - Subject: ${subject || 'N/A'}
 - From: ${senderName || 'Sender'}
 - Tone: ${tone || 'professional and friendly'}
-- Your name: ${userName || 'Me'}
+- Your name: ${fullName}
 
 Original email:
 """
@@ -2165,13 +2277,16 @@ ${emailBody}
 """
 
 Instructions:
-1. Write a reply that directly addresses the email content
-2. Keep it concise (2-4 sentences unless complex)
-3. Be warm but professional
-4. Sign off with the user's first name: "${userName ? userName.split(' ')[0] : 'Best'}"
-5. Do NOT include calendar invite links, meeting URLs, or video call links in the reply text. Those are shared separately.
-6. Do NOT include subject line or formal signatures
-7. Return ONLY the reply text, no explanations
+1. Write a complete reply that directly addresses the sender's request or question
+2. Keep it professional, clear, and useful; usually 4-7 sentences unless the email is very simple
+3. If the email asks for confirmation, availability, feedback, approval, or information, answer in a way the user can quickly edit
+4. Do not sound robotic; use natural business language
+5. End with this exact closing format:
+Best regards,
+${fullName}
+6. Do NOT include calendar invite links, meeting URLs, or video call links in the reply text. Those are shared separately.
+7. Do NOT include a subject line
+8. Return ONLY the reply text, no explanations
 
 Draft reply:`;
 
