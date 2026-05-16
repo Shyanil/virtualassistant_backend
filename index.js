@@ -2260,7 +2260,7 @@ app.get('/api/gmail/message/:id', validateApiKey, async (req, res) => {
 app.post('/api/gmail/generate-reply', validateApiKey, async (req, res) => {
   try {
     const { emailBody, subject, senderName, tone, userName } = req.body;
-    if (!emailBody) return res.status(400).json({ error: 'Missing emailBody' });
+    const safeEmailBody = String(emailBody || '').trim() || `Subject: ${subject || 'No subject'}\nFrom: ${senderName || 'Sender'}\nNo readable body was available. Draft a brief professional reply asking for any missing details if needed.`;
 
     const fullName = userName || 'Shyanil Mishra';
     const prompt = `You are a professional email assistant. Draft a polished, professional reply to this email.
@@ -2273,7 +2273,7 @@ Context:
 
 Original email:
 """
-${emailBody}
+${safeEmailBody}
 """
 
 Instructions:
@@ -2290,7 +2290,7 @@ ${fullName}
 
 Draft reply:`;
 
-    const model = selectModel(emailBody);
+    const model = selectModel(safeEmailBody);
     const response = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
@@ -2299,7 +2299,10 @@ Draft reply:`;
       }
     );
 
-    const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 'I could not generate a reply.';
+    const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    if (!reply) {
+      return res.status(502).json({ error: 'AI did not return a reply. Please try again.' });
+    }
 
     res.json({ reply });
   } catch (err) {
