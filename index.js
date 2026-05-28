@@ -970,6 +970,95 @@ async function sendMeetingInvitationWA({ to, name, date, time, person, meeting_l
   };
 }
 
+// ─── WhatsApp Helper: Reminder to User (template 3) ──────────────────
+// meeting_reminder_user_v1 — note: no meeting_link param in this template.
+async function sendMeetingReminderUserWA({ to, name, date, time, person, header_image }) {
+  const authKey = process.env.MSG91_AUTH_KEY;
+  const fromNumber = process.env.MSG91_WHATSAPP_NUMBER;
+  const defaultImg = process.env.MSG91_CONFIRMATION_IMAGE;
+  const headerImg = header_image || defaultImg || '';
+
+  if (!authKey || !fromNumber) {
+    throw new Error('MSG91 credentials not configured in .env');
+  }
+
+  const payload = {
+    integrated_number: fromNumber,
+    content_type: 'template',
+    payload: {
+      messaging_product: 'whatsapp',
+      type: 'template',
+      template: {
+        name: 'meeting_reminder_user_v1',
+        language: { code: 'en', policy: 'deterministic' },
+        namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+        to_and_components: [{
+          to,
+          components: {
+            header_1:    { type: 'image', value: headerImg },
+            body_date:   { type: 'text', value: date,   parameter_name: 'date' },
+            body_name:   { type: 'text', value: name,   parameter_name: 'name' },
+            body_time:   { type: 'text', value: time,   parameter_name: 'time' },
+            body_person: { type: 'text', value: person, parameter_name: 'person' },
+          }
+        }]
+      }
+    }
+  };
+
+  const response = await axios.post(
+    'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+    payload,
+    { headers: { authkey: authKey, 'Content-Type': 'application/json' } }
+  );
+  return response.data;
+}
+
+// ─── WhatsApp Helper: Reminder to Invitee (template 4) ───────────────
+// meeting_reminder_invitee_v1 — includes meeting_link.
+async function sendMeetingReminderInviteeWA({ to, name, date, time, person, meeting_link, header_image }) {
+  const authKey = process.env.MSG91_AUTH_KEY;
+  const fromNumber = process.env.MSG91_WHATSAPP_NUMBER;
+  const defaultImg = process.env.MSG91_CONFIRMATION_IMAGE;
+  const headerImg = header_image || defaultImg || '';
+
+  if (!authKey || !fromNumber) {
+    throw new Error('MSG91 credentials not configured in .env');
+  }
+
+  const payload = {
+    integrated_number: fromNumber,
+    content_type: 'template',
+    payload: {
+      messaging_product: 'whatsapp',
+      type: 'template',
+      template: {
+        name: 'meeting_reminder_invitee_v1',
+        language: { code: 'en', policy: 'deterministic' },
+        namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+        to_and_components: [{
+          to,
+          components: {
+            header_1:          { type: 'image', value: headerImg },
+            body_name:         { type: 'text', value: name,         parameter_name: 'name' },
+            body_person:       { type: 'text', value: person,       parameter_name: 'person' },
+            body_date:         { type: 'text', value: date,         parameter_name: 'date' },
+            body_time:         { type: 'text', value: time,         parameter_name: 'time' },
+            body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+          }
+        }]
+      }
+    }
+  };
+
+  const response = await axios.post(
+    'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+    payload,
+    { headers: { authkey: authKey, 'Content-Type': 'application/json' } }
+  );
+  return response.data;
+}
+
 
 // ─── WhatsApp Template: Meeting Confirmation (raw endpoint) ──────────
 /**
@@ -1159,6 +1248,124 @@ app.post('/api/whatsapp/send-reminder', validateApiKeyOrN8nSecret, async (req, r
       success: false,
       error: errorMessage,
     });
+  }
+});
+
+
+// ─── Reminder Dispatch Job (templates 3 & 4) ─────────────────────────
+/**
+ * 🕒 POST /api/reminders/send-job
+ *
+ * Called by n8n at T-minus the meeting. Sends the 30-min reminder to BOTH
+ * parties (template 3 → user, template 4 → invitee) — but only if the meeting
+ * is still confirmed. A cancelled meeting is skipped, never reminded.
+ *
+ * Auth: x-shared-secret (n8n) or x-api-key (manual testing).
+ *
+ * Body: { "event_id": "uuid" }
+ */
+app.post('/api/reminders/send-job', validateApiKeyOrN8nSecret, async (req, res) => {
+  const eventId = req.body.event_id || req.body.eventId || null;
+
+  if (!eventId) {
+    return res.status(400).json({ success: false, error: 'event_id is required' });
+  }
+
+  try {
+    const { data: event, error } = await supabase
+      .from('extracted_events')
+      .select('*')
+      .eq('id', eventId)
+      .single();
+
+    if (error || !event) {
+      return res.status(404).json({ success: false, error: 'Event not found' });
+    }
+
+    // Cancellation guard — the whole reason this endpoint exists.
+    if (event.status === 'cancelled') {
+      console.log(`🚫 [Reminders:send-job] event=${eventId} cancelled — skipping`);
+      return res.json({ success: true, skipped: true, reason: 'Meeting has been cancelled by user' });
+    }
+
+    if (event.status !== 'confirmed') {
+      console.log(`⏭️  [Reminders:send-job] event=${eventId} status=${event.status} — skipping`);
+      return res.json({ success: true, skipped: true, reason: 'event_not_confirmed', status: event.status });
+    }
+
+    // Idempotency — don't re-send if both reminders already went out.
+    if (event.user_reminder_status === 'sent' && event.invitee_reminder_status === 'sent') {
+      return res.json({ success: true, skipped: true, reason: 'reminder_already_sent' });
+    }
+
+    const userPhone = cleanPhoneNumber(event.user_phone);
+    const attendeePhone = cleanPhoneNumber(event.attendee_phone);
+    const prettyDate = formatDisplayDate(event.event_date);
+    const prettyTime = formatDisplayTime(event.event_time);
+    const userWaName = event.user_name || 'Member';
+    const inviteeWaName = event.attendee_name || 'Guest';
+    const meetingLink = req.body.meeting_link || event.meeting_link || 'See calendar invite';
+
+    const update = {};
+    const result = { user: null, invitee: null };
+
+    if (userPhone) {
+      try {
+        result.user = await sendMeetingReminderUserWA({
+          to: [userPhone],
+          name: userWaName,
+          date: prettyDate,
+          time: prettyTime,
+          person: inviteeWaName,
+        });
+        update.user_reminder_status = 'sent';
+        update.user_reminder_sent_at = new Date().toISOString();
+      } catch (waErr) {
+        console.error('❌ [Reminders:send-job] user reminder failed:', waErr.response?.data || waErr.message);
+        update.user_reminder_status = 'failed';
+      }
+    }
+
+    if (attendeePhone) {
+      try {
+        result.invitee = await sendMeetingReminderInviteeWA({
+          to: [attendeePhone],
+          name: inviteeWaName,
+          date: prettyDate,
+          time: prettyTime,
+          person: userWaName,
+          meeting_link: meetingLink,
+        });
+        update.invitee_reminder_status = 'sent';
+        update.invitee_reminder_sent_at = new Date().toISOString();
+      } catch (waErr) {
+        console.error('❌ [Reminders:send-job] invitee reminder failed:', waErr.response?.data || waErr.message);
+        update.invitee_reminder_status = 'failed';
+      }
+    }
+
+    // Keep the legacy single-channel column in sync for older dashboards/queries.
+    const anySent = update.user_reminder_status === 'sent' || update.invitee_reminder_status === 'sent';
+    if (anySent) {
+      update.whatsapp_reminder_status = 'sent';
+      update.whatsapp_sent_at = new Date().toISOString();
+      update.reminder_error = null;
+    }
+
+    await supabase.from('extracted_events').update(update).eq('id', eventId);
+
+    return res.json({
+      success: true,
+      skipped: false,
+      event_id: eventId,
+      user_reminder_status: update.user_reminder_status || 'skipped',
+      invitee_reminder_status: update.invitee_reminder_status || 'skipped',
+      msg91: result,
+    });
+  } catch (err) {
+    const errorMessage = err.response?.data || err.message;
+    console.error('❌ [Reminders:send-job] error:', errorMessage);
+    return res.status(500).json({ success: false, error: errorMessage });
   }
 });
 
@@ -1384,6 +1591,9 @@ app.patch('/api/events/:id/confirm', validateApiKey, async (req, res) => {
       call_reminder_at: callReminderDate.toISOString(),
       whatsapp_reminder_status: whatsappStatus,
       call_reminder_status: callStatus,
+      // State-machine: reminders (templates 3 & 4) are armed but not yet sent.
+      user_reminder_status: whatsappStatus,
+      invitee_reminder_status: whatsappStatus,
       reminder_error: null,
     };
 
@@ -1396,6 +1606,56 @@ app.patch('/api/events/:id/confirm', validateApiKey, async (req, res) => {
 
     if (updateError) {
       throw updateError;
+    }
+
+    // ── Send confirmation (template 1 → user) + invitation (template 2 → invitee)
+    //    and record the confirmation half of the state machine. Resilient: a
+    //    messaging failure marks the column 'failed' but never blocks the n8n enqueue.
+    const confirmUpdate = {};
+    const prettyDate = formatDisplayDate(eventDate);
+    const prettyTime = formatDisplayTime(eventTime);
+    const meetingLink = req.body.meeting_link || req.body.meetingLink || 'See calendar invite';
+    const userWaName = req.body.user_name || existingEvent.user_name || 'Member';
+    const inviteeWaName = attendeeName || 'Guest';
+    const cleanAttendeePhone = cleanPhoneNumber(attendeePhone);
+
+    try {
+      await sendMeetingConfirmationWA({
+        to: [userPhone],
+        name: userWaName,
+        date: prettyDate,
+        time: prettyTime,
+        person: inviteeWaName,
+        meeting_link: meetingLink,
+      });
+      confirmUpdate.user_confirmation_status = 'sent';
+      confirmUpdate.user_confirmation_sent_at = new Date().toISOString();
+    } catch (waErr) {
+      console.error('❌ [Events:confirm] user confirmation send failed:', waErr.response?.data || waErr.message);
+      confirmUpdate.user_confirmation_status = 'failed';
+    }
+
+    if (cleanAttendeePhone) {
+      try {
+        await sendMeetingInvitationWA({
+          to: [cleanAttendeePhone],
+          name: inviteeWaName,
+          date: prettyDate,
+          time: prettyTime,
+          person: userWaName,
+          meeting_link: meetingLink,
+        });
+        confirmUpdate.invitee_confirmation_status = 'sent';
+        confirmUpdate.invitee_confirmation_sent_at = new Date().toISOString();
+      } catch (waErr) {
+        console.error('❌ [Events:confirm] invitee invitation send failed:', waErr.response?.data || waErr.message);
+        confirmUpdate.invitee_confirmation_status = 'failed';
+      }
+    }
+
+    if (Object.keys(confirmUpdate).length > 0) {
+      await supabase.from('extracted_events').update(confirmUpdate).eq('id', eventId);
+      Object.assign(updatedEvent, confirmUpdate);
     }
 
     const n8nPayload = buildReminderJobPayload({
