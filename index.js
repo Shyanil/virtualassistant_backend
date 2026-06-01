@@ -440,7 +440,7 @@ function buildReminderJobPayload({
   };
 }
 
-async function saveExtractedEventFromIntent({ transcript, intent, userPhone, attendeePhone }) {
+async function saveExtractedEventFromIntent({ transcript, intent, userPhone, attendeePhone, userId }) {
   if (!['create_event', 'set_reminder'].includes(intent.action) || !intent.title) {
     return { saved: false, id: null, skipped: true, error: null, n8nTriggered: false, n8nPayload: null };
   }
@@ -448,7 +448,6 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
   const timezone = intent.timeZone || 'Asia/Kolkata';
   const eventDate = intent.date || null;
   const eventTime = intent.time || null;
-  const attendeeName = extractAttendeeName(intent.title) || extractAttendeeName(transcript);
   let whatsappReminderDate = null;
   let callReminderDate = null;
   let whatsappStatus = 'pending';
@@ -457,22 +456,77 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
 
   if (eventDate && eventTime) {
     meetingDate = localDateTimeToUtc(eventDate, eventTime, timezone);
-    whatsappReminderDate = calculateReminderDate(meetingDate.toISOString(), WHATSAPP_REMINDER_LEAD_MINUTES);
-    callReminderDate = calculateReminderDate(meetingDate.toISOString(), CALL_REMINDER_LEAD_MINUTES);
+    whatsappReminderDate = calculateReminderDate(meetingDate.toISOString(), 30); // T-30 mins
+    callReminderDate = calculateReminderDate(meetingDate.toISOString(), 15); // T-15 mins
     whatsappStatus = whatsappReminderDate <= new Date() ? 'skipped' : 'pending';
     callStatus = callReminderDate <= new Date() ? 'skipped' : 'pending';
   }
 
-  const { data, error } = await supabase
+  // 1. Extract and build attendees list
+  let names = [];
+  if (Array.isArray(intent.attendees) && intent.attendees.length > 0) {
+    names = intent.attendees;
+  } else {
+    const singleName = extractAttendeeName(intent.title) || extractAttendeeName(transcript);
+    if (singleName) {
+      names = [singleName];
+    }
+  }
+
+  const cleanUserPhone = cleanPhoneNumber(userPhone);
+  const attendeesList = [];
+
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i].trim();
+    let phone = null;
+    let phoneSource = 'unknown';
+
+    // A. Check contact book if userId is provided
+    if (userId && userId !== 'dev-expo-anonymous') {
+      try {
+        const { data: contact } = await supabase
+          .from('contacts')
+          .select('phone')
+          .eq('user_id', userId)
+          .eq('name', name)
+          .maybeSingle();
+
+        if (contact?.phone) {
+          phone = cleanPhoneNumber(contact.phone);
+          phoneSource = 'contact_book';
+        }
+      } catch (err) {
+        console.warn(`⚠️ [Contact Book] Query failed for ${name}:`, err.message);
+      }
+    }
+
+    // B. Fallback to passed attendeePhone for the first invitee if still empty
+    if (!phone && i === 0 && attendeePhone) {
+      phone = cleanPhoneNumber(attendeePhone);
+      phoneSource = 'detected';
+    }
+
+    attendeesList.push({
+      name,
+      phone: phone || null,
+      confirmation_status: 'pending',
+      confirmation_sent_at: null,
+      reminder_status: 'pending',
+      reminder_sent_at: null,
+      phone_source: phoneSource
+    });
+  }
+
+  // 2. Insert extracted event with the attendees array
+  const { data: eventData, error: insertError } = await supabase
     .from('extracted_events')
     .insert({
       event_title: intent.title,
       event_date: eventDate,
       event_time: eventTime,
       timezone,
-      user_phone: cleanPhoneNumber(userPhone),
-      attendee_name: attendeeName,
-      attendee_phone: cleanPhoneNumber(attendeePhone),
+      user_phone: cleanUserPhone,
+      attendees: attendeesList,
       confidence: null,
       status: eventDate && eventTime ? 'confirmed' : 'detected',
       context_sentence: transcript,
@@ -484,19 +538,92 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
     .select('*')
     .single();
 
-  if (error) {
-    throw error;
+  if (insertError) {
+    throw insertError;
   }
 
+  // 3. Immediately Dispatch Confirmations
+  const prettyDate = formatDisplayDate(eventDate);
+  const prettyTime = formatDisplayTime(eventTime);
+  const meetingLink = intent.location || 'See calendar invite';
+
+  // A. Host User Confirmation
+  let userConfirmSuccess = false;
+  if (cleanUserPhone) {
+    try {
+      await sendMeetingConfirmationWA({
+        to: [cleanUserPhone],
+        name: 'Member',
+        date: prettyDate,
+        time: prettyTime,
+        person: attendeesList[0]?.name || 'Guest',
+        meeting_link: meetingLink,
+      });
+      userConfirmSuccess = true;
+    } catch (waErr) {
+      console.error('❌ [AutoConfirm:User] MSG91 Outbound failed:', waErr.response?.data || waErr.message);
+    }
+  }
+
+  // B. Invitees Confirmations
+  let anyInviteeSent = false;
+  let hasPendingInvitee = false;
+
+  for (let i = 0; i < attendeesList.length; i++) {
+    const attendee = attendeesList[i];
+    if (attendee.phone) {
+      try {
+        await sendMeetingInvitationWA({
+          to: [attendee.phone],
+          name: attendee.name,
+          date: prettyDate,
+          time: prettyTime,
+          person: 'Member',
+          meeting_link: meetingLink,
+        });
+        attendee.confirmation_status = 'sent';
+        attendee.confirmation_sent_at = new Date().toISOString();
+        anyInviteeSent = true;
+      } catch (waErr) {
+        console.error(`❌ [AutoConfirm:Invitee] MSG91 failed for ${attendee.name}:`, waErr.response?.data || waErr.message);
+        attendee.confirmation_status = 'failed';
+      }
+    } else {
+      attendee.confirmation_status = 'pending';
+      hasPendingInvitee = true;
+    }
+  }
+
+  // Aggregate statuses
+  const userConfirmationStatus = userConfirmSuccess ? 'sent' : 'failed';
+  const inviteeConfirmationStatus = anyInviteeSent ? (hasPendingInvitee ? 'pending' : 'sent') : (hasPendingInvitee ? 'pending' : 'skipped');
+
+  // Save back updated confirmation states
+  const { data: updatedEvent, error: updateError } = await supabase
+    .from('extracted_events')
+    .update({
+      attendees: attendeesList,
+      user_confirmation_status: userConfirmationStatus,
+      user_confirmation_sent_at: userConfirmSuccess ? new Date().toISOString() : null,
+      invitee_confirmation_status: inviteeConfirmationStatus,
+      invitee_confirmation_sent_at: anyInviteeSent ? new Date().toISOString() : null,
+    })
+    .eq('id', eventData.id)
+    .select('*')
+    .single();
+
+  const finalEvent = updatedEvent || eventData;
+
+  // 4. Trigger n8n for reminders if pending
   let n8nTriggered = false;
   let n8nPayload = null;
 
-  if (data && meetingDate && whatsappReminderDate && whatsappStatus === 'pending') {
+  if (finalEvent && meetingDate && whatsappReminderDate && whatsappStatus === 'pending') {
     n8nPayload = buildReminderJobPayload({
-      event: data,
-      userPhone: cleanPhoneNumber(userPhone),
-      attendeeName,
-      attendeePhone: cleanPhoneNumber(attendeePhone),
+      event: finalEvent,
+      userPhone: cleanUserPhone,
+      attendeeName: attendeesList[0]?.name || 'Guest',
+      attendeePhone: attendeesList[0]?.phone || null,
       meetingDate,
       whatsappReminderDate,
     });
@@ -512,11 +639,11 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
           whatsapp_reminder_status: 'failed',
           reminder_error: typeof errorMessage === 'string' ? errorMessage : JSON.stringify(errorMessage),
         })
-        .eq('id', data.id);
+        .eq('id', finalEvent.id);
 
       return {
         saved: true,
-        id: data?.id || null,
+        id: finalEvent.id,
         skipped: false,
         error: null,
         n8nTriggered: false,
@@ -528,7 +655,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
 
   return {
     saved: true,
-    id: data?.id || null,
+    id: finalEvent.id,
     skipped: false,
     error: null,
     n8nTriggered,
@@ -652,6 +779,7 @@ Return ONLY valid JSON:
         intent,
         userPhone,
         attendeePhone,
+        userId,
       });
       if (extractedEventResult.skipped) {
         console.log('ℹ️ [DB] Extracted event save skipped for action:', intent.action);
@@ -890,6 +1018,10 @@ async function sendMeetingConfirmationWA({ to, name, date, time, person, meeting
   const defaultImg = process.env.MSG91_CONFIRMATION_IMAGE;
   const headerImg  = header_image || defaultImg || '';
 
+  if (!authKey || !fromNumber) {
+    throw new Error('MSG91 credentials not configured in .env');
+  }
+
   const payload = {
     integrated_number: fromNumber,
     content_type: 'template',
@@ -897,18 +1029,18 @@ async function sendMeetingConfirmationWA({ to, name, date, time, person, meeting
       messaging_product: 'whatsapp',
       type: 'template',
       template: {
-        name: 'meeting_confirmation_notification',
+        name: 'user_meeting_confirmation_v2',
         language: { code: 'en', policy: 'deterministic' },
-        namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+        namespace: process.env.MSG91_TEMPLATE_NAMESPACE || null,
         to_and_components: [{
           to,
           components: {
             header_1:          { type: 'image', value: headerImg },
-            body_name:         { type: 'text', value: name,         parameter_name: 'name' },
-            body_person:       { type: 'text', value: person,       parameter_name: 'person' },
-            body_date:         { type: 'text', value: date,         parameter_name: 'date' },
             body_time:         { type: 'text', value: time,         parameter_name: 'time' },
+            body_date:         { type: 'text', value: date,         parameter_name: 'date' },
+            body_name:         { type: 'text', value: name,         parameter_name: 'name' },
             body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+            body_person:       { type: 'text', value: person,       parameter_name: 'person' }
           }
         }]
       }
@@ -940,18 +1072,18 @@ async function sendMeetingInvitationWA({ to, name, date, time, person, meeting_l
       messaging_product: 'whatsapp',
       type: 'template',
       template: {
-        name: 'meeting_invitation_notification',
+        name: 'invitee_meeting_confirmation_v2',
         language: { code: 'en', policy: 'deterministic' },
-        namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+        namespace: process.env.MSG91_TEMPLATE_NAMESPACE || null,
         to_and_components: [{
           to,
           components: {
             header_1: { type: 'image', value: headerImg },
-            body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
-            body_person: { type: 'text', value: person, parameter_name: 'person' },
             body_time: { type: 'text', value: time, parameter_name: 'time' },
             body_name: { type: 'text', value: name, parameter_name: 'name' },
-            body_date: { type: 'text', value: date, parameter_name: 'date' },
+            body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+            body_person: { type: 'text', value: person, parameter_name: 'person' },
+            body_date: { type: 'text', value: date, parameter_name: 'date' }
           }
         }]
       }
@@ -970,9 +1102,7 @@ async function sendMeetingInvitationWA({ to, name, date, time, person, meeting_l
   };
 }
 
-// ─── WhatsApp Helper: Reminder to User (template 3) ──────────────────
-// meeting_reminder_user_v1 — note: no meeting_link param in this template.
-async function sendMeetingReminderUserWA({ to, name, date, time, person, header_image }) {
+async function sendMeetingReminderUserWA({ to, name, date, time, person, meeting_link, reminder_time, header_image }) {
   const authKey = process.env.MSG91_AUTH_KEY;
   const fromNumber = process.env.MSG91_WHATSAPP_NUMBER;
   const defaultImg = process.env.MSG91_CONFIRMATION_IMAGE;
@@ -989,17 +1119,19 @@ async function sendMeetingReminderUserWA({ to, name, date, time, person, header_
       messaging_product: 'whatsapp',
       type: 'template',
       template: {
-        name: 'meeting_reminder_user_v1',
+        name: 'user_meeting_reminder_v2',
         language: { code: 'en', policy: 'deterministic' },
-        namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+        namespace: process.env.MSG91_TEMPLATE_NAMESPACE || null,
         to_and_components: [{
           to,
           components: {
-            header_1:    { type: 'image', value: headerImg },
-            body_date:   { type: 'text', value: date,   parameter_name: 'date' },
-            body_name:   { type: 'text', value: name,   parameter_name: 'name' },
-            body_time:   { type: 'text', value: time,   parameter_name: 'time' },
-            body_person: { type: 'text', value: person, parameter_name: 'person' },
+            header_1:           { type: 'image', value: headerImg },
+            body_reminder_time: { type: 'text', value: reminder_time || '30 minutes', parameter_name: 'reminder_time' },
+            body_time:          { type: 'text', value: time, parameter_name: 'time' },
+            body_date:          { type: 'text', value: date, parameter_name: 'date' },
+            body_name:          { type: 'text', value: name, parameter_name: 'name' },
+            body_person:        { type: 'text', value: person, parameter_name: 'person' },
+            body_meeting_link:  { type: 'text', value: meeting_link, parameter_name: 'meeting_link' }
           }
         }]
       }
@@ -1014,8 +1146,6 @@ async function sendMeetingReminderUserWA({ to, name, date, time, person, header_
   return response.data;
 }
 
-// ─── WhatsApp Helper: Reminder to Invitee (template 4) ───────────────
-// meeting_reminder_invitee_v1 — includes meeting_link.
 async function sendMeetingReminderInviteeWA({ to, name, date, time, person, meeting_link, header_image }) {
   const authKey = process.env.MSG91_AUTH_KEY;
   const fromNumber = process.env.MSG91_WHATSAPP_NUMBER;
@@ -1033,18 +1163,18 @@ async function sendMeetingReminderInviteeWA({ to, name, date, time, person, meet
       messaging_product: 'whatsapp',
       type: 'template',
       template: {
-        name: 'meeting_reminder_invitee_v1',
+        name: 'invitee_meeting_reminder_v2',
         language: { code: 'en', policy: 'deterministic' },
-        namespace: 'cdb14b0d_8c1d_4c3c_afe5_e00265b36206',
+        namespace: process.env.MSG91_TEMPLATE_NAMESPACE || null,
         to_and_components: [{
           to,
           components: {
             header_1:          { type: 'image', value: headerImg },
-            body_name:         { type: 'text', value: name,         parameter_name: 'name' },
             body_person:       { type: 'text', value: person,       parameter_name: 'person' },
-            body_date:         { type: 'text', value: date,         parameter_name: 'date' },
-            body_time:         { type: 'text', value: time,         parameter_name: 'time' },
             body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
+            body_name:         { type: 'text', value: name,         parameter_name: 'name' },
+            body_time:         { type: 'text', value: time,         parameter_name: 'time' },
+            body_date:         { type: 'text', value: date,         parameter_name: 'date' }
           }
         }]
       }
@@ -1179,15 +1309,16 @@ app.post('/api/whatsapp/send-reminder', validateApiKeyOrN8nSecret, async (req, r
       event = data;
     }
 
+    const firstAttendee = Array.isArray(event?.attendees) && event.attendees.length > 0 ? event.attendees[0] : null;
     const recipients = Array.isArray(req.body.to) && req.body.to.length > 0
       ? req.body.to
       : Array.isArray(req.body.recipient_phones) && req.body.recipient_phones.length > 0
         ? req.body.recipient_phones
-        : [event?.user_phone, event?.attendee_phone].filter(Boolean);
+        : [event?.user_phone, firstAttendee ? firstAttendee.phone : null].filter(Boolean);
 
     const to = recipients.map(cleanPhoneNumber).filter(Boolean);
     const name = req.body.name || 'Member';
-    const person = req.body.person || req.body.attendee_name || event?.attendee_name || 'Team';
+    const person = req.body.person || req.body.attendee_name || (firstAttendee ? firstAttendee.name : 'Team');
     const date = req.body.date || formatDisplayDate(event?.event_date);
     const time = req.body.time || formatDisplayTime(event?.event_time);
     const meetingLink = req.body.meeting_link || req.body.meetingLink || 'See calendar invite';
@@ -1299,11 +1430,12 @@ app.post('/api/reminders/send-job', validateApiKeyOrN8nSecret, async (req, res) 
     }
 
     const userPhone = cleanPhoneNumber(event.user_phone);
-    const attendeePhone = cleanPhoneNumber(event.attendee_phone);
+    const firstAttendee = Array.isArray(event.attendees) && event.attendees.length > 0 ? event.attendees[0] : null;
+    const attendeePhone = firstAttendee ? cleanPhoneNumber(firstAttendee.phone) : null;
     const prettyDate = formatDisplayDate(event.event_date);
     const prettyTime = formatDisplayTime(event.event_time);
     const userWaName = event.user_name || 'Member';
-    const inviteeWaName = event.attendee_name || 'Guest';
+    const inviteeWaName = firstAttendee?.name || 'Guest';
     const meetingLink = req.body.meeting_link || event.meeting_link || 'See calendar invite';
 
     const update = {};
@@ -1525,186 +1657,286 @@ app.post('/api/whatsapp/confirm-meeting', validateApiKey, async (req, res) => {
  *   "event_title": "Sales Call"
  * }
  */
-app.patch('/api/events/:id/confirm', validateApiKey, async (req, res) => {
+/**
+ * 📲 Endpoint called when user manually types or updates an invitee's WhatsApp number.
+ * Updates the attendees JSONB array, upserts the contact book, and fires the pending confirmation.
+ *
+ * POST /api/events/:id/invitee-phone
+ */
+app.post('/api/events/:id/invitee-phone', validateApiKey, async (req, res) => {
   const eventId = req.params.id;
+  const { phone, name } = req.body;
+
+  if (!phone || !name) {
+    return res.status(400).json({ error: 'Missing phone or name in request body' });
+  }
 
   try {
-    const { data: existingEvent, error: fetchError } = await supabase
+    // 1. Fetch current event
+    const { data: event, error: fetchErr } = await supabase
       .from('extracted_events')
       .select('*')
       .eq('id', eventId)
       .single();
 
-    if (fetchError) {
-      throw fetchError;
+    if (fetchErr || !event) {
+      return res.status(404).json({ error: 'Event not found' });
     }
 
-    const attendeeName = req.body.attendee_name || req.body.customer_name || existingEvent.attendee_name || null;
-    const attendeePhone = req.body.attendee_phone || req.body.customer_phone || existingEvent.attendee_phone || null;
-    const userPhone = cleanPhoneNumber(req.body.user_phone || req.body.userPhone || existingEvent.user_phone || DEFAULT_TEST_USER_PHONE);
-    const eventTitle = req.body.event_title || existingEvent.event_title || 'Meeting';
-    const timezone = req.body.timezone || existingEvent.timezone || 'Asia/Kolkata';
-    let eventDate = req.body.event_date || existingEvent.event_date || null;
-    let eventTime = req.body.event_time || existingEvent.event_time || null;
-    let meetingDate;
+    const cleanPhone = cleanPhoneNumber(phone);
+    const attendees = Array.isArray(event.attendees) ? event.attendees : [];
 
-    if (req.body.meeting_time) {
-      meetingDate = new Date(req.body.meeting_time);
-      if (Number.isNaN(meetingDate.getTime())) {
-        return res.status(400).json({ error: 'meeting_time must be a valid date/time' });
-      }
-      const parts = getDateTimePartsInZone(meetingDate, timezone);
-      eventDate = parts.date;
-      eventTime = parts.time;
+    // Find attendee by name (case-insensitive)
+    let index = attendees.findIndex(a => String(a.name).trim().toLowerCase() === String(name).trim().toLowerCase());
+    if (index === -1 && attendees.length === 1) {
+      // If only one attendee exists, fallback to index 0
+      index = 0;
+    }
+
+    if (index !== -1) {
+      attendees[index].phone = cleanPhone;
+      attendees[index].phone_source = 'user_typed';
     } else {
-      if (!eventDate || !eventTime) {
-        return res.status(400).json({
-          error: 'event_date and event_time are required when meeting_time is not provided',
-        });
-      }
-      meetingDate = localDateTimeToUtc(eventDate, eventTime, timezone);
-      eventTime = String(eventTime).slice(0, 5);
-    }
-
-    if (!attendeePhone || !eventDate || !eventTime) {
-      return res.status(400).json({
-        error: 'attendee_phone, event_date, and event_time are required',
+      attendees.push({
+        name: name.trim(),
+        phone: cleanPhone,
+        confirmation_status: 'pending',
+        confirmation_sent_at: null,
+        reminder_status: 'pending',
+        reminder_sent_at: null,
+        phone_source: 'user_typed'
       });
+      index = attendees.length - 1;
     }
 
-    const whatsappReminderDate = calculateReminderDate(meetingDate.toISOString(), WHATSAPP_REMINDER_LEAD_MINUTES);
-    const callReminderDate = calculateReminderDate(meetingDate.toISOString(), CALL_REMINDER_LEAD_MINUTES);
-    const now = new Date();
-    const whatsappStatus = whatsappReminderDate <= now ? 'skipped' : 'pending';
-    const callStatus = callReminderDate <= now ? 'skipped' : 'pending';
-
-    const updatePayload = {
-      status: 'confirmed',
-      user_phone: userPhone,
-      attendee_name: attendeeName,
-      attendee_phone: cleanPhoneNumber(attendeePhone),
-      event_title: eventTitle,
-      event_date: eventDate,
-      event_time: eventTime,
-      timezone,
-      whatsapp_reminder_at: whatsappReminderDate.toISOString(),
-      call_reminder_at: callReminderDate.toISOString(),
-      whatsapp_reminder_status: whatsappStatus,
-      call_reminder_status: callStatus,
-      // State-machine: reminders (templates 3 & 4) are armed but not yet sent.
-      user_reminder_status: whatsappStatus,
-      invitee_reminder_status: whatsappStatus,
-      reminder_error: null,
-    };
-
-    const { data: updatedEvent, error: updateError } = await supabase
+    // 2. Save phone back to event
+    await supabase
       .from('extracted_events')
-      .update(updatePayload)
-      .eq('id', eventId)
-      .select()
-      .single();
+      .update({ attendees })
+      .eq('id', eventId);
 
-    if (updateError) {
-      throw updateError;
+    // 3. Save/Upsert to contact book lookup
+    if (event.user_phone) {
+      const { data: userData } = await supabase
+        .from('users')
+        .select('firebase_uid')
+        .eq('phone', event.user_phone)
+        .maybeSingle();
+
+      const userId = userData?.firebase_uid || 'dev-expo-anonymous';
+
+      await supabase.from('contacts').upsert({
+        user_id: userId,
+        name: attendees[index].name,
+        phone: cleanPhone
+      }, { onConflict: 'user_id, name' });
     }
 
-    // ── Send confirmation (template 1 → user) + invitation (template 2 → invitee)
-    //    and record the confirmation half of the state machine. Resilient: a
-    //    messaging failure marks the column 'failed' but never blocks the n8n enqueue.
-    const confirmUpdate = {};
-    const prettyDate = formatDisplayDate(eventDate);
-    const prettyTime = formatDisplayTime(eventTime);
-    const meetingLink = req.body.meeting_link || req.body.meetingLink || 'See calendar invite';
-    const userWaName = req.body.user_name || existingEvent.user_name || 'Member';
-    const inviteeWaName = attendeeName || 'Guest';
-    const cleanAttendeePhone = cleanPhoneNumber(attendeePhone);
+    // 4. Send invitee_meeting_confirmation_v2 immediately
+    const prettyDate = formatDisplayDate(event.event_date);
+    const prettyTime = formatDisplayTime(event.event_time);
+    const meetingLink = event.meeting_link || 'See calendar invite';
+    const userWaName = 'Member';
 
+    let success = false;
     try {
-      await sendMeetingConfirmationWA({
-        to: [userPhone],
-        name: userWaName,
+      await sendMeetingInvitationWA({
+        to: [cleanPhone],
+        name: attendees[index].name,
         date: prettyDate,
         time: prettyTime,
-        person: inviteeWaName,
+        person: userWaName,
         meeting_link: meetingLink,
       });
-      confirmUpdate.user_confirmation_status = 'sent';
-      confirmUpdate.user_confirmation_sent_at = new Date().toISOString();
+
+      attendees[index].confirmation_status = 'sent';
+      attendees[index].confirmation_sent_at = new Date().toISOString();
+      success = true;
     } catch (waErr) {
-      console.error('❌ [Events:confirm] user confirmation send failed:', waErr.response?.data || waErr.message);
-      confirmUpdate.user_confirmation_status = 'failed';
+      console.error('❌ [invitee-phone] Failed to send MSG91 confirmation:', waErr.response?.data || waErr.message);
+      attendees[index].confirmation_status = 'failed';
     }
 
-    if (cleanAttendeePhone) {
+    // 5. Update confirmation statuses in database
+    await supabase
+      .from('extracted_events')
+      .update({
+        attendees,
+        invitee_confirmation_status: success ? 'sent' : 'failed',
+        invitee_confirmation_sent_at: success ? new Date().toISOString() : null
+      })
+      .eq('id', eventId);
+
+    return res.json({ success: true, attendee: attendees[index] });
+  } catch (error) {
+    console.error('❌ [invitee-phone] Error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * 🕒 Cron/n8n triggered User reminder endpoint.
+ *
+ * POST /api/reminders/user/:event_id
+ */
+app.post('/api/reminders/user/:event_id', validateApiKeyOrN8nSecret, async (req, res) => {
+  const eventId = req.params.event_id;
+
+  try {
+    const { data: event, error } = await supabase
+      .from('extracted_events')
+      .select('*')
+      .eq('id', eventId)
+      .single();
+
+    if (error || !event) {
+      return res.status(404).json({ success: false, error: 'Event not found' });
+    }
+
+    if (event.status === 'cancelled') {
+      return res.json({ success: true, skipped: true, reason: 'event_cancelled' });
+    }
+
+    if (event.user_reminder_status === 'sent') {
+      return res.json({ success: true, skipped: true, reason: 'already_sent' });
+    }
+
+    const userPhone = cleanPhoneNumber(event.user_phone);
+    if (!userPhone) {
+      return res.status(400).json({ success: false, error: 'User phone number not found' });
+    }
+
+    const prettyDate = formatDisplayDate(event.event_date);
+    const prettyTime = formatDisplayTime(event.event_time);
+    const invitees = Array.isArray(event.attendees) ? event.attendees : [];
+    const firstInviteeName = invitees[0]?.name || 'Guest';
+
+    let success = false;
+    try {
+      await sendMeetingReminderUserWA({
+        to: [userPhone],
+        name: 'Member',
+        date: prettyDate,
+        time: prettyTime,
+        person: firstInviteeName,
+        meeting_link: event.meeting_link || 'See calendar invite',
+        reminder_time: '30 minutes'
+      });
+      success = true;
+    } catch (waErr) {
+      console.error('❌ [Reminders:User] Outbound failed:', waErr.response?.data || waErr.message);
+    }
+
+    await supabase
+      .from('extracted_events')
+      .update({
+        user_reminder_status: success ? 'sent' : 'failed',
+        user_reminder_sent_at: success ? new Date().toISOString() : null
+      })
+      .eq('id', eventId);
+
+    return res.json({ success });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * 🕒 Cron/n8n triggered Invitee reminder endpoint.
+ *
+ * POST /api/reminders/invitee/:event_id
+ */
+app.post('/api/reminders/invitee/:event_id', validateApiKeyOrN8nSecret, async (req, res) => {
+  const eventId = req.params.event_id;
+
+  try {
+    const { data: event, error } = await supabase
+      .from('extracted_events')
+      .select('*')
+      .eq('id', eventId)
+      .single();
+
+    if (error || !event) {
+      return res.status(404).json({ success: false, error: 'Event not found' });
+    }
+
+    if (event.status === 'cancelled') {
+      return res.json({ success: true, skipped: true, reason: 'event_cancelled' });
+    }
+
+    if (event.invitee_reminder_status === 'sent') {
+      return res.json({ success: true, skipped: true, reason: 'already_sent' });
+    }
+
+    const attendees = Array.isArray(event.attendees) ? event.attendees : [];
+    if (attendees.length === 0) {
+      await supabase
+        .from('extracted_events')
+        .update({ invitee_reminder_status: 'skipped' })
+        .eq('id', eventId);
+      return res.json({ success: true, skipped: true, reason: 'no_invitees' });
+    }
+
+    const prettyDate = formatDisplayDate(event.event_date);
+    const prettyTime = formatDisplayTime(event.event_time);
+    const meetingLink = event.meeting_link || 'See calendar invite';
+    const userWaName = 'Member';
+
+    let anySent = false;
+    let hasPendingPhone = false;
+
+    for (let i = 0; i < attendees.length; i++) {
+      const attendee = attendees[i];
+      const attendeePhone = cleanPhoneNumber(attendee.phone);
+
+      if (!attendeePhone) {
+        attendee.reminder_status = 'skipped';
+        hasPendingPhone = true;
+        continue;
+      }
+
+      if (attendee.reminder_status === 'sent') {
+        anySent = true;
+        continue;
+      }
+
       try {
-        await sendMeetingInvitationWA({
-          to: [cleanAttendeePhone],
-          name: inviteeWaName,
+        await sendMeetingReminderInviteeWA({
+          to: [attendeePhone],
+          name: attendee.name,
           date: prettyDate,
           time: prettyTime,
           person: userWaName,
-          meeting_link: meetingLink,
+          meeting_link: meetingLink
         });
-        confirmUpdate.invitee_confirmation_status = 'sent';
-        confirmUpdate.invitee_confirmation_sent_at = new Date().toISOString();
+        attendee.reminder_status = 'sent';
+        attendee.reminder_sent_at = new Date().toISOString();
+        anySent = true;
       } catch (waErr) {
-        console.error('❌ [Events:confirm] invitee invitation send failed:', waErr.response?.data || waErr.message);
-        confirmUpdate.invitee_confirmation_status = 'failed';
+        console.error(`❌ [Reminders:Invitee] Failed for ${attendee.name}:`, waErr.response?.data || waErr.message);
+        attendee.reminder_status = 'failed';
       }
     }
 
-    if (Object.keys(confirmUpdate).length > 0) {
-      await supabase.from('extracted_events').update(confirmUpdate).eq('id', eventId);
-      Object.assign(updatedEvent, confirmUpdate);
+    let inviteeReminderStatus = 'failed';
+    if (anySent) {
+      inviteeReminderStatus = hasPendingPhone ? 'pending' : 'sent';
+    } else if (hasPendingPhone) {
+      inviteeReminderStatus = 'pending';
     }
 
-    const n8nPayload = buildReminderJobPayload({
-      event: updatedEvent,
-      userPhone,
-      attendeeName,
-      attendeePhone: cleanPhoneNumber(attendeePhone),
-      meetingDate,
-      whatsappReminderDate,
-    });
+    await supabase
+      .from('extracted_events')
+      .update({
+        attendees,
+        invitee_reminder_status: inviteeReminderStatus,
+        invitee_reminder_sent_at: anySent ? new Date().toISOString() : null
+      })
+      .eq('id', eventId);
 
-    let n8nResponse = null;
-
-    if (whatsappStatus === 'pending') {
-      try {
-        n8nResponse = await sendWhatsAppReminderJobToN8n(n8nPayload);
-      } catch (n8nError) {
-        const errorMessage = n8nError.response?.data || n8nError.message;
-
-        await supabase
-          .from('extracted_events')
-          .update({
-            whatsapp_reminder_status: 'failed',
-            reminder_error: typeof errorMessage === 'string' ? errorMessage : JSON.stringify(errorMessage),
-          })
-          .eq('id', eventId);
-
-        return res.status(502).json({
-          success: false,
-          error: 'Failed to send WhatsApp reminder job to n8n',
-          details: errorMessage,
-          n8n_payload: n8nPayload,
-        });
-      }
-    }
-
-    return res.json({
-      success: true,
-      event: updatedEvent,
-      n8n_triggered: whatsappStatus === 'pending',
-      n8n_payload: n8nPayload,
-      n8n_response: n8nResponse,
-    });
-  } catch (error) {
-    console.error('❌ [Events] Confirm event error:', error);
-
-    return res.status(500).json({
-      error: error.message,
-    });
+    return res.json({ success: anySent, attendees });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -1755,7 +1987,8 @@ app.get('/api/events/:id/reminder-check', requireN8nSharedSecret, async (req, re
     }
 
     const userPhone = cleanPhoneNumber(event.user_phone);
-    const attendeePhone = cleanPhoneNumber(event.attendee_phone);
+    const firstAttendee = Array.isArray(event.attendees) && event.attendees.length > 0 ? event.attendees[0] : null;
+    const attendeePhone = firstAttendee ? cleanPhoneNumber(firstAttendee.phone) : null;
     const reminderDate = event.whatsapp_reminder_at ? new Date(event.whatsapp_reminder_at) : null;
     const reminderMatches = reminderDate
       && Math.abs(reminderDate.getTime() - requestedReminderDate.getTime()) < 1000;
@@ -1798,7 +2031,7 @@ app.get('/api/events/:id/reminder-check', requireN8nSharedSecret, async (req, re
     const payload = buildReminderJobPayload({
       event,
       userPhone,
-      attendeeName: event.attendee_name,
+      attendeeName: firstAttendee ? firstAttendee.name : 'Guest',
       attendeePhone,
       meetingDate,
       whatsappReminderDate: reminderDate,
