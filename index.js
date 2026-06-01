@@ -440,7 +440,114 @@ function buildReminderJobPayload({
   };
 }
 
-async function saveExtractedEventFromIntent({ transcript, intent, userPhone, attendeePhone, userId }) {
+async function getGoogleAccessToken(userId) {
+  try {
+    const { data: account, error } = await supabaseAdmin
+      .from('gmail_accounts')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error || !account) return null;
+
+    const now = new Date();
+    const expiresAt = account.expires_at ? new Date(account.expires_at) : null;
+
+    // If still valid (with 5-minute buffer), return current access token
+    if (expiresAt && (expiresAt.getTime() - now.getTime() > 5 * 60 * 1000)) {
+      return account.access_token;
+    }
+
+    // Otherwise, refresh it if refresh token is present
+    if (account.refresh_token) {
+      console.log(`🔄 [Google OAuth] Refreshing access token for user ${userId}...`);
+      const response = await axios.post('https://oauth2.googleapis.com/token', {
+        client_id: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        refresh_token: account.refresh_token,
+        grant_type: 'refresh_token',
+      });
+
+      const newAccessToken = response.data.access_token;
+      const expiresIn = response.data.expires_in || 3600;
+      const newExpiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
+
+      await supabaseAdmin
+        .from('gmail_accounts')
+        .update({
+          access_token: newAccessToken,
+          expires_at: newExpiresAt,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', userId);
+
+      console.log(`✅ [Google OAuth] Access token refreshed successfully.`);
+      return newAccessToken;
+    }
+
+    return account.access_token;
+  } catch (err) {
+    console.error('❌ [Google OAuth] Refresh token error:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+async function autoCreateGoogleCalendarEvent({ accessToken, title, description, date, time, timezone, location }) {
+  const startTime = new Date(`${date}T${time}:00`);
+  const endTime = new Date(startTime.getTime() + 60 * 60 * 1000); // 1 hour default
+
+  const eventPayload = {
+    summary: title,
+    description: description || 'Created automatically by Adamslave Assistant',
+    location: location || 'Google Meet',
+    start: {
+      dateTime: startTime.toISOString(),
+      timeZone: timezone || 'Asia/Kolkata',
+    },
+    end: {
+      dateTime: endTime.toISOString(),
+      timeZone: timezone || 'Asia/Kolkata',
+    },
+    conferenceData: {
+      createRequest: {
+        requestId: `adamslave-auto-${Date.now()}`,
+        conferenceSolutionKey: { type: 'hangoutsMeet' },
+      },
+    },
+    reminders: {
+      useDefault: false,
+      overrides: [
+        { method: 'popup', minutes: 60 } // Popup reminder 1 hour before meeting, as requested!
+      ]
+    }
+  };
+
+  try {
+    const response = await axios.post(
+      'https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1',
+      eventPayload,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    const meetLink = response.data.conferenceData?.entryPoints?.find(ep => ep.entryPointType === 'video')?.uri;
+    return {
+      success: true,
+      eventLink: response.data.htmlLink,
+      meetLink: meetLink || null,
+      eventId: response.data.id
+    };
+  } catch (err) {
+    console.error('❌ [AutoCalendar] API call failed:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+async function saveExtractedEventFromIntent({ transcript, intent, userPhone, attendeePhone, userId, userName }) {
   if (!['create_event', 'set_reminder'].includes(intent.action) || !intent.title) {
     return { saved: false, id: null, skipped: true, error: null, n8nTriggered: false, n8nPayload: null };
   }
@@ -517,7 +624,29 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
     });
   }
 
-  // 2. Insert extracted event with the attendees array
+  // 1.5 Automatically Create Google Calendar Event & Generate Meet Link if Authenticated
+  let generatedMeetLink = null;
+  if (userId && userId !== 'dev-expo-anonymous' && eventDate && eventTime) {
+    const googleToken = await getGoogleAccessToken(userId);
+    if (googleToken) {
+      console.log(`📅 [AutoCalendar] Automatically syncing to Google Calendar for user: ${userId}...`);
+      const calRes = await autoCreateGoogleCalendarEvent({
+        accessToken: googleToken,
+        title: intent.title,
+        description: intent.notes || transcript || 'Created automatically by Adamslave Assistant',
+        date: eventDate,
+        time: eventTime,
+        timezone: timezone,
+        location: intent.location || 'Google Meet',
+      });
+      if (calRes && calRes.success) {
+        generatedMeetLink = calRes.meetLink || calRes.eventLink;
+        console.log(`✅ [AutoCalendar] Event synced! Meet Link: ${generatedMeetLink}`);
+      }
+    }
+  }
+
+  // 2. Insert extracted event with the attendees array and new meeting_link
   const { data: eventData, error: insertError } = await supabase
     .from('extracted_events')
     .insert({
@@ -527,6 +656,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
       timezone,
       user_phone: cleanUserPhone,
       attendees: attendeesList,
+      meeting_link: generatedMeetLink,
       confidence: null,
       status: eventDate && eventTime ? 'confirmed' : 'detected',
       context_sentence: transcript,
@@ -545,7 +675,8 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
   // 3. Immediately Dispatch Confirmations
   const prettyDate = formatDisplayDate(eventDate);
   const prettyTime = formatDisplayTime(eventTime);
-  const meetingLink = intent.location || 'See calendar invite';
+  const meetingLink = generatedMeetLink || intent.location || 'See calendar invite';
+  const prettyUserName = userName || 'Member';
 
   // A. Host User Confirmation
   let userConfirmSuccess = false;
@@ -553,7 +684,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
     try {
       await sendMeetingConfirmationWA({
         to: [cleanUserPhone],
-        name: 'Member',
+        name: prettyUserName,
         date: prettyDate,
         time: prettyTime,
         person: attendeesList[0]?.name || 'Guest',
@@ -578,7 +709,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
           name: attendee.name,
           date: prettyDate,
           time: prettyTime,
-          person: 'Member',
+          person: prettyUserName,
           meeting_link: meetingLink,
         });
         attendee.confirmation_status = 'sent';
@@ -649,6 +780,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
         n8nTriggered: false,
         n8nPayload,
         n8nError: errorMessage,
+        meeting_link: finalEvent.meeting_link,
       };
     }
   }
@@ -661,6 +793,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
     n8nTriggered,
     n8nPayload,
     n8nError: null,
+    meeting_link: finalEvent.meeting_link,
   };
 }
 
@@ -780,6 +913,7 @@ Return ONLY valid JSON:
         userPhone,
         attendeePhone,
         userId,
+        userName: userProfile?.full_name || 'Member',
       });
       if (extractedEventResult.skipped) {
         console.log('ℹ️ [DB] Extracted event save skipped for action:', intent.action);
@@ -800,6 +934,8 @@ Return ONLY valid JSON:
       db_error: dbResult.error,
       extracted_event_saved: extractedEventResult.saved,
       extracted_event_id: extractedEventResult.id,
+      extracted_event_meeting_link: extractedEventResult.meeting_link || null,
+      meeting_link: extractedEventResult.meeting_link || null,
       extracted_event_skipped: extractedEventResult.skipped,
       extracted_event_error: extractedEventResult.error,
       extracted_event_n8n_triggered: extractedEventResult.n8nTriggered,
@@ -1527,8 +1663,8 @@ app.post('/api/reminders/send-job', validateApiKeyOrN8nSecret, async (req, res) 
  * }
  */
 app.post('/api/whatsapp/confirm-meeting', validateApiKey, async (req, res) => {
-  const { userId, title, date, time, person, meeting_link, source } = req.body;
-  const logCtx = `[WhatsApp:confirm] source=${source || 'unknown'} userId=${userId}`;
+  const { userId, eventId, title, date, time, person, meeting_link, source } = req.body;
+  const logCtx = `[WhatsApp:confirm] source=${source || 'unknown'} userId=${userId} eventId=${eventId || 'none'}`;
 
   if (!userId || !title || !date || !time) {
     return res.status(400).json({
@@ -1556,26 +1692,41 @@ app.post('/api/whatsapp/confirm-meeting', validateApiKey, async (req, res) => {
       return res.json({ sent: false, reason: 'no_phone' });
     }
 
-    // 2️⃣ Duplicate check — look for recent voice_log with same title+date+time already sent
-    const { data: existingLog } = await supabase
-      .from('voice_logs')
-      .select('id, whatsapp_sent')
-      .eq('user_id', userId)
-      .eq('title', title)
-      .eq('date', date)
-      .eq('time', time)
-      .eq('whatsapp_sent', true)
-      .maybeSingle();
-
-    if (existingLog) {
-      console.warn(`⚠️ ${logCtx} Duplicate: WhatsApp already sent for "${title}" on ${date} ${time}`);
-      return res.json({ sent: false, reason: 'already_sent' });
-    }
-
-    // 3️⃣ Format fields for the WhatsApp template
     let cleanPhone = userData.phone.replace(/\D/g, '');
     if (cleanPhone.length === 10) cleanPhone = '91' + cleanPhone;
 
+    // 2️⃣ Duplicate check — look for recent extracted_event already confirmed & sent
+    let existingEvent = null;
+    if (eventId) {
+      const { data, error: evErr } = await supabase
+        .from('extracted_events')
+        .select('id, user_confirmation_status')
+        .eq('id', eventId)
+        .maybeSingle();
+      if (!evErr && data) {
+        existingEvent = data;
+      }
+    } else {
+      const { data, error: evErr } = await supabase
+        .from('extracted_events')
+        .select('id, user_confirmation_status')
+        .eq('user_phone', cleanPhone)
+        .eq('event_title', title)
+        .eq('event_date', date)
+        .eq('event_time', time)
+        .eq('user_confirmation_status', 'sent')
+        .maybeSingle();
+      if (!evErr && data) {
+        existingEvent = data;
+      }
+    }
+
+    if (existingEvent && existingEvent.user_confirmation_status === 'sent') {
+      console.warn(`⚠️ ${logCtx} Duplicate: WhatsApp already sent for event ${eventId || title}`);
+      return res.json({ sent: false, reason: 'already_sent', phone: `+${cleanPhone}` });
+    }
+
+    // 3️⃣ Format fields for the WhatsApp template
     // Format date: "2026-04-07" → "7th April 2026"
     const dateObj = new Date(date + 'T00:00:00');
     const day     = dateObj.getDate();
@@ -1615,7 +1766,25 @@ app.post('/api/whatsapp/confirm-meeting', validateApiKey, async (req, res) => {
       return res.json({ sent: false, reason: 'msg91_error', error: msg91Err.response?.data || msg91Err.message });
     }
 
-    // 5️⃣ Mark as sent in voice_logs (upsert — graceful if column doesn't exist)
+    // 5️⃣ Update confirmation state in extracted_events
+    const targetEventId = eventId || existingEvent?.id;
+    if (targetEventId) {
+      try {
+        await supabase
+          .from('extracted_events')
+          .update({
+            user_confirmation_status: 'sent',
+            user_confirmation_sent_at: new Date().toISOString(),
+            meeting_link: waMeetingLink !== 'See calendar invite' ? waMeetingLink : undefined,
+          })
+          .eq('id', targetEventId);
+        console.log(`✅ ${logCtx} Updated user_confirmation_status in extracted_events.`);
+      } catch (dbUpdateErr) {
+        console.warn(`⚠️ ${logCtx} Could not update extracted_events state:`, dbUpdateErr.message);
+      }
+    }
+
+    // 6️⃣ Mark as sent in voice_logs (upsert — graceful if column doesn't exist)
     try {
       await supabase.from('voice_logs').insert({
         user_id:         userId,
@@ -2120,9 +2289,15 @@ app.post('/api/reminders/whatsapp-result', requireN8nSharedSecret, async (req, r
  */
 app.post('/api/google/create-event', validateApiKey, async (req, res) => {
   try {
-    const { accessToken, title, description, date, time, durationMinutes, timeZone, location } = req.body;
+    const { accessToken, userId, title, description, date, time, durationMinutes, timeZone, location } = req.body;
     
-    if (!accessToken) return res.status(400).json({ error: 'Missing Google access token' });
+    let token = accessToken;
+    if (!token && userId) {
+      console.log(`🔑 [Google] Missing accessToken. Fetching stored token for userId: ${userId}...`);
+      token = await getGoogleAccessToken(userId);
+    }
+
+    if (!token) return res.status(400).json({ error: 'Missing Google access token or unable to retrieve stored token for user' });
     if (!title || !date || !time) return res.status(400).json({ error: 'Missing event details' });
 
     const startTime = new Date(`${date}T${time}:00`);
@@ -2149,6 +2324,12 @@ app.post('/api/google/create-event', validateApiKey, async (req, res) => {
           conferenceSolutionKey: { type: 'hangoutsMeet' },
         },
       },
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: 'popup', minutes: 60 } // Exactly 1 hour before meeting, as requested!
+        ]
+      }
     };
 
     const response = await axios.post(
@@ -2156,7 +2337,7 @@ app.post('/api/google/create-event', validateApiKey, async (req, res) => {
       event,
       {
         headers: {
-          Authorization: `Bearer ${accessToken}`,
+          Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
       }
