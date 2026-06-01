@@ -1862,9 +1862,19 @@ app.post('/api/events/:id/invitee-phone', validateApiKey, async (req, res) => {
       index = 0;
     }
 
+    // Idempotency: if this attendee is already confirmed on the same number,
+    // don't send the WhatsApp invite again (the frontend may submit on both the
+    // capture form and the confirm action).
+    const existingAttendee = index !== -1 ? attendees[index] : null;
+    const alreadyConfirmed = Boolean(
+      existingAttendee &&
+      cleanPhoneNumber(existingAttendee.phone) === cleanPhone &&
+      (existingAttendee.confirmation_status === 'confirmed' || existingAttendee.confirmation_status === 'sent')
+    );
+
     if (index !== -1) {
       attendees[index].phone = cleanPhone;
-      attendees[index].phone_source = 'user_typed';
+      attendees[index].phone_source = attendees[index].phone_source || 'user_typed';
     } else {
       attendees.push({
         name: name.trim(),
@@ -1899,6 +1909,11 @@ app.post('/api/events/:id/invitee-phone', validateApiKey, async (req, res) => {
         name: attendees[index].name,
         phone: cleanPhone
       }, { onConflict: 'user_id,name' });
+    }
+
+    // Already confirmed on this number — phone/contact are saved, skip the resend.
+    if (alreadyConfirmed) {
+      return res.json({ success: true, alreadySent: true, attendee: attendees[index] });
     }
 
     // 4. Send invitee_meeting_confirmation_v2 immediately
