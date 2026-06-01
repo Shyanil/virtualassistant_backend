@@ -712,7 +712,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
           person: prettyUserName,
           meeting_link: meetingLink,
         });
-        attendee.confirmation_status = 'sent';
+        attendee.confirmation_status = 'confirmed';
         attendee.confirmation_sent_at = new Date().toISOString();
         anyInviteeSent = true;
       } catch (waErr) {
@@ -1918,7 +1918,7 @@ app.post('/api/events/:id/invitee-phone', validateApiKey, async (req, res) => {
         meeting_link: meetingLink,
       });
 
-      attendees[index].confirmation_status = 'sent';
+      attendees[index].confirmation_status = 'confirmed';
       attendees[index].confirmation_sent_at = new Date().toISOString();
       success = true;
     } catch (waErr) {
