@@ -1898,7 +1898,7 @@ app.post('/api/events/:id/invitee-phone', validateApiKey, async (req, res) => {
         user_id: userId,
         name: attendees[index].name,
         phone: cleanPhone
-      }, { onConflict: 'user_id, name' });
+      }, { onConflict: 'user_id,name' });
     }
 
     // 4. Send invitee_meeting_confirmation_v2 immediately
