@@ -655,6 +655,7 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
       event_time: eventTime,
       timezone,
       user_phone: cleanUserPhone,
+      user_name: userName || null,
       attendees: attendeesList,
       meeting_link: generatedMeetLink,
       confidence: null,
@@ -885,7 +886,7 @@ Return ONLY valid JSON:
     }
 
     const userPhone = cleanPhoneNumber(req.body.user_phone || req.body.userPhone || userProfile?.phone || DEFAULT_TEST_USER_PHONE);
-    const attendeePhone = cleanPhoneNumber(req.body.attendee_phone || req.body.attendeePhone || DEFAULT_TEST_ATTENDEE_PHONE);
+    const attendeePhone = cleanPhoneNumber(req.body.attendee_phone || req.body.attendeePhone || null);
 
     try {
       console.log(`💾 [DB] Saving voice log for user: ${userId || 'dev-expo-anonymous'}${userId ? '' : ' (fallback)'}`);
@@ -1920,7 +1921,7 @@ app.post('/api/events/:id/invitee-phone', validateApiKey, async (req, res) => {
     const prettyDate = formatDisplayDate(event.event_date);
     const prettyTime = formatDisplayTime(event.event_time);
     const meetingLink = event.meeting_link || 'See calendar invite';
-    const userWaName = 'Member';
+    const userWaName = event.user_name || 'Member';
 
     let success = false;
     try {
@@ -2064,7 +2065,7 @@ app.post('/api/reminders/invitee/:event_id', validateApiKeyOrN8nSecret, async (r
     const prettyDate = formatDisplayDate(event.event_date);
     const prettyTime = formatDisplayTime(event.event_time);
     const meetingLink = event.meeting_link || 'See calendar invite';
-    const userWaName = 'Member';
+    const userWaName = event.user_name || 'Member';
 
     let anySent = false;
     let hasPendingPhone = false;
