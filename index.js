@@ -673,78 +673,11 @@ async function saveExtractedEventFromIntent({ transcript, intent, userPhone, att
     throw insertError;
   }
 
-  // 3. Immediately Dispatch Confirmations
-  const prettyDate = formatDisplayDate(eventDate);
-  const prettyTime = formatDisplayTime(eventTime);
-  const meetingLink = generatedMeetLink || intent.location || 'See calendar invite';
-  const prettyUserName = userName || 'Member';
-
-  // A. Host User Confirmation
-  let userConfirmSuccess = false;
-  if (cleanUserPhone) {
-    try {
-      await sendMeetingConfirmationWA({
-        to: [cleanUserPhone],
-        name: prettyUserName,
-        date: prettyDate,
-        time: prettyTime,
-        person: attendeesList[0]?.name || 'Guest',
-        meeting_link: meetingLink,
-      });
-      userConfirmSuccess = true;
-    } catch (waErr) {
-      console.error('❌ [AutoConfirm:User] MSG91 Outbound failed:', waErr.response?.data || waErr.message);
-    }
-  }
-
-  // B. Invitees Confirmations
-  let anyInviteeSent = false;
-  let hasPendingInvitee = false;
-
-  for (let i = 0; i < attendeesList.length; i++) {
-    const attendee = attendeesList[i];
-    if (attendee.phone) {
-      try {
-        await sendMeetingInvitationWA({
-          to: [attendee.phone],
-          name: attendee.name,
-          date: prettyDate,
-          time: prettyTime,
-          person: prettyUserName,
-          meeting_link: meetingLink,
-        });
-        attendee.confirmation_status = 'confirmed';
-        attendee.confirmation_sent_at = new Date().toISOString();
-        anyInviteeSent = true;
-      } catch (waErr) {
-        console.error(`❌ [AutoConfirm:Invitee] MSG91 failed for ${attendee.name}:`, waErr.response?.data || waErr.message);
-        attendee.confirmation_status = 'failed';
-      }
-    } else {
-      attendee.confirmation_status = 'pending';
-      hasPendingInvitee = true;
-    }
-  }
-
-  // Aggregate statuses
-  const userConfirmationStatus = userConfirmSuccess ? 'sent' : 'failed';
-  const inviteeConfirmationStatus = anyInviteeSent ? (hasPendingInvitee ? 'pending' : 'sent') : (hasPendingInvitee ? 'pending' : 'skipped');
-
-  // Save back updated confirmation states
-  const { data: updatedEvent, error: updateError } = await supabase
-    .from('extracted_events')
-    .update({
-      attendees: attendeesList,
-      user_confirmation_status: userConfirmationStatus,
-      user_confirmation_sent_at: userConfirmSuccess ? new Date().toISOString() : null,
-      invitee_confirmation_status: inviteeConfirmationStatus,
-      invitee_confirmation_sent_at: anyInviteeSent ? new Date().toISOString() : null,
-    })
-    .eq('id', eventData.id)
-    .select('*')
-    .single();
-
-  const finalEvent = updatedEvent || eventData;
+  // Notifications are intentionally NOT sent here.
+  // The frontend triggers them only after the user reviews and taps "Confirm & Notify".
+  // Host WA → /api/whatsapp/confirm-meeting
+  // Invitee WA → /api/events/:id/invitee-phone
+  const finalEvent = eventData;
 
   // 4. Trigger n8n for reminders if pending
   let n8nTriggered = false;
