@@ -1148,12 +1148,12 @@ async function sendMeetingInvitationWA({ to, name, date, time, person, meeting_l
         to_and_components: [{
           to,
           components: {
-            header_1: { type: 'image', value: headerImg },
-            body_time: { type: 'text', value: time, parameter_name: 'time' },
-            body_name: { type: 'text', value: name, parameter_name: 'name' },
+            header_1:          { type: 'image', value: headerImg },
+            body_time:         { type: 'text', value: time,         parameter_name: 'time' },
+            body_name:         { type: 'text', value: person,       parameter_name: 'name' },   // template: "{{body_name}} has invited you" → host name
             body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
-            body_person: { type: 'text', value: person, parameter_name: 'person' },
-            body_date: { type: 'text', value: date, parameter_name: 'date' }
+            body_person:       { type: 'text', value: name,         parameter_name: 'person' }, // template: "Hi {{body_person}}" → invitee name
+            body_date:         { type: 'text', value: date,         parameter_name: 'date' }
           }
         }]
       }
@@ -1240,9 +1240,9 @@ async function sendMeetingReminderInviteeWA({ to, name, date, time, person, meet
           to,
           components: {
             header_1:          { type: 'image', value: headerImg },
-            body_person:       { type: 'text', value: person,       parameter_name: 'person' },
+            body_person:       { type: 'text', value: name,         parameter_name: 'person' }, // template: "Hi {{body_person}}" → invitee name
             body_meeting_link: { type: 'text', value: meeting_link, parameter_name: 'meeting_link' },
-            body_name:         { type: 'text', value: name,         parameter_name: 'name' },
+            body_name:         { type: 'text', value: person,       parameter_name: 'name' },   // template: "{{body_name}} invited you" → host name
             body_time:         { type: 'text', value: time,         parameter_name: 'time' },
             body_date:         { type: 'text', value: date,         parameter_name: 'date' }
           }
