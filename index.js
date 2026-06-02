@@ -1807,6 +1807,7 @@ app.post('/api/events/:id/invitee-phone', validateApiKey, async (req, res) => {
     );
 
     if (index !== -1) {
+      attendees[index].name = name.trim();   // overwrite stale AI name with the user-edited name
       attendees[index].phone = cleanPhone;
       attendees[index].phone_source = attendees[index].phone_source || 'user_typed';
     } else {
@@ -1860,7 +1861,7 @@ app.post('/api/events/:id/invitee-phone', validateApiKey, async (req, res) => {
     try {
       await sendMeetingInvitationWA({
         to: [cleanPhone],
-        name: attendees[index].name,
+        name: name.trim(),   // use the req.body name (user-edited), not the stale DB value
         date: prettyDate,
         time: prettyTime,
         person: userWaName,
