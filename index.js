@@ -992,6 +992,101 @@ const upload = multer({
 });
 
 /**
+ * 🎧 Meeting Media Summary (Gemini audio/video understanding)
+ * Receives: multipart/form-data with 'media' audio/video file and optional 'userId'
+ */
+app.post('/api/meetings/summarize-media', validateApiKey, upload.single('media'), async (req, res) => {
+  try {
+    const file = req.file;
+    const { userId } = req.body;
+
+    if (!file) return res.status(400).json({ error: 'No meeting media uploaded' });
+    if (!file.mimetype?.startsWith('audio/') && !file.mimetype?.startsWith('video/')) {
+      return res.status(400).json({ error: 'Please upload an audio or video file' });
+    }
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'Gemini API key is not configured' });
+    }
+
+    console.log(`🎧 [MeetingMedia] Summarizing ${file.originalname} (${file.mimetype}, ${file.size} bytes)...`);
+
+    const prompt = `You are a meeting transcription and recap assistant.
+
+Analyze the attached meeting audio/video. First transcribe the spoken meeting content. Then produce a concise recap.
+
+Return ONLY valid JSON in exactly this shape:
+{
+  "transcript": "plain text transcript of the spoken meeting, speaker labels if confidently detectable",
+  "summary": "2-4 sentence plain-English meeting summary",
+  "actionItems": ["one action item per string; include owner if mentioned"],
+  "followUp": "short ready-to-send follow-up message for attendees"
+}
+
+If speech is unclear, still return valid JSON and explain the limitation in summary.`;
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType: file.mimetype, data: file.buffer.toString('base64') } }
+          ]
+        }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 3000,
+          responseMimeType: 'application/json',
+        },
+      },
+      { timeout: 120000 }
+    );
+
+    const raw = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    let parsed;
+    try {
+      parsed = parseJsonObject(raw);
+    } catch (parseError) {
+      console.warn('⚠️ [MeetingMedia] JSON parse failed:', parseError.message);
+      parsed = {
+        transcript: '',
+        summary: raw.substring(0, 1200) || 'Could not parse the meeting summary.',
+        actionItems: [],
+        followUp: '',
+      };
+    }
+
+    const result = {
+      transcript: String(parsed.transcript || '').trim(),
+      summary: String(parsed.summary || '').trim() || 'Meeting processed successfully.',
+      actionItems: Array.isArray(parsed.actionItems)
+        ? parsed.actionItems.map(item => String(item).trim()).filter(Boolean)
+        : [],
+      followUp: String(parsed.followUp || parsed.follow_up || '').trim(),
+      raw,
+    };
+
+    if (userId) {
+      await supabase.from('voice_logs').insert({
+        user_id: userId,
+        transcript: result.transcript || `Uploaded meeting media: ${file.originalname}`,
+        action: 'meeting_media_summary',
+        title: 'Meeting Media Summary',
+        notes: result.summary,
+        status: 'done',
+      });
+    }
+
+    console.log(`✅ [MeetingMedia] Summary complete — ${result.actionItems.length} action items`);
+    res.json(result);
+  } catch (error) {
+    const errMsg = error.response?.data?.error?.message || error.message;
+    console.error('❌ [MeetingMedia] Error:', errMsg);
+    res.status(500).json({ error: `Meeting media summary failed: ${errMsg}` });
+  }
+});
+
+/**
  * 📄 Analyze Document (Gemini 2.5 Pro Vision)
  * Receives: multipart/form-data with 'document' file and 'userId'
  */
