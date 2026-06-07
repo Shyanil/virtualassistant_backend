@@ -991,6 +991,91 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 } // 50 MB limit
 });
 
+async function summarizeMeetingTranscriptWithGemini(transcript) {
+  const prompt = `You are a meeting recap assistant.
+
+Turn this meeting transcript/recap into a clean, structured meeting note:
+
+"""${transcript}"""
+
+Return ONLY valid JSON in exactly this shape:
+{
+  "summary": "2-4 sentence plain-English meeting summary",
+  "actionItems": ["one action item per string; include owner if mentioned"],
+  "followUp": "short ready-to-send follow-up message for attendees"
+}`;
+
+  const response = await axios.post(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 1200,
+        responseMimeType: 'application/json',
+      },
+    },
+    { timeout: 60000 }
+  );
+
+  const raw = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  let parsed;
+  try {
+    parsed = parseJsonObject(raw);
+  } catch (parseError) {
+    console.warn('⚠️ [MeetingText] JSON parse failed:', parseError.message);
+    parsed = {
+      summary: raw.substring(0, 1200) || 'Could not parse the meeting summary.',
+      actionItems: [],
+      followUp: '',
+    };
+  }
+
+  return {
+    summary: String(parsed.summary || '').trim() || 'Meeting processed successfully.',
+    actionItems: Array.isArray(parsed.actionItems)
+      ? parsed.actionItems.map(item => String(item).trim()).filter(Boolean)
+      : [],
+    followUp: String(parsed.followUp || parsed.follow_up || '').trim(),
+    raw,
+  };
+}
+
+/**
+ * 📝 Meeting Text Summary
+ * Receives: { transcript, userId }
+ */
+app.post('/api/meetings/summarize-text', validateApiKey, async (req, res) => {
+  try {
+    const { transcript, userId } = req.body;
+    if (!transcript?.trim()) return res.status(400).json({ error: 'Missing transcript' });
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'Gemini API key is not configured' });
+    }
+
+    console.log(`📝 [MeetingText] Summarizing transcript (${transcript.length} chars)...`);
+    const result = await summarizeMeetingTranscriptWithGemini(transcript);
+
+    if (userId) {
+      await supabase.from('voice_logs').insert({
+        user_id: userId,
+        transcript,
+        action: 'meeting_text_summary',
+        title: 'Meeting Voice Summary',
+        notes: result.summary,
+        status: 'done',
+      });
+    }
+
+    console.log(`✅ [MeetingText] Summary complete — ${result.actionItems.length} action items`);
+    res.json(result);
+  } catch (error) {
+    const errMsg = error.response?.data?.error?.message || error.message;
+    console.error('❌ [MeetingText] Error:', errMsg);
+    res.status(500).json({ error: `Meeting text summary failed: ${errMsg}` });
+  }
+});
+
 /**
  * 🎧 Meeting Media Summary (Gemini audio/video understanding)
  * Receives: multipart/form-data with 'media' audio/video file and optional 'userId'
