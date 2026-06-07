@@ -259,6 +259,16 @@ function parseJsonObject(rawText) {
   return JSON.parse(cleaned);
 }
 
+function formatFollowUpLogNotes(result) {
+  const parts = [];
+  if (result.followUp) parts.push(`Message: ${result.followUp}`);
+  if (Array.isArray(result.actionItems) && result.actionItems.length) {
+    parts.push(`Signals:\n${result.actionItems.map(item => `- ${item}`).join('\n')}`);
+  }
+  if (result.summary) parts.push(`Context: ${result.summary}`);
+  return parts.join('\n\n') || 'Follow-up captured.';
+}
+
 function toCalendarDateTime(date, time) {
   return `${date.replace(/-/g, '')}T${String(time || '00:00').replace(':', '')}00`;
 }
@@ -1062,7 +1072,7 @@ app.post('/api/meetings/summarize-text', validateApiKey, async (req, res) => {
         transcript,
         action: 'meeting_text_summary',
         title: 'Meeting Voice Summary',
-        notes: result.summary,
+        notes: formatFollowUpLogNotes(result),
         status: 'done',
       });
     }
@@ -1157,7 +1167,7 @@ If speech is unclear, still return valid JSON and explain the limitation in summ
         transcript: result.transcript || `Uploaded meeting media: ${file.originalname}`,
         action: 'meeting_media_summary',
         title: 'Meeting Media Summary',
-        notes: result.summary,
+        notes: formatFollowUpLogNotes(result),
         status: 'done',
       });
     }
