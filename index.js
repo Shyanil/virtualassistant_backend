@@ -1001,6 +1001,67 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 } // 50 MB limit
 });
 
+// Shared instruction block for every follow-up recap (voice, audio, text, document).
+// Teaches Gemini to count the people the follow-up is actually being sent to and to
+// write a singular vs. group message accordingly.
+const RECAP_JSON_INSTRUCTIONS = `Return ONLY valid JSON in exactly this shape:
+{
+  "attendeeCount": <integer — how many people this follow-up will be sent to, i.e. the OTHER participants besides the speaker/author. Use 1 for a one-on-one, 2 or more for a group. Never use 0.>,
+  "summary": "2-4 sentence plain-English meeting summary",
+  "actionItems": ["one action item per string; include the owner if mentioned"],
+  "followUp": "a short, ready-to-send follow-up message to the other attendee(s)"
+}
+
+Rules for "followUp":
+- If attendeeCount is 1, write a personal one-to-one message. Greet the single person ("Hi <name>," or "Hi," if the name is unknown) and thank them in the singular — say "Thank you", and NEVER "Thank you everyone".
+- If attendeeCount is 2 or more, address the group ("Hi everyone,") and you may use "Thank you everyone".
+- Keep it concise, warm, and professional.`;
+
+function normalizeRecapResult(parsed, raw) {
+  const count = Number(parsed.attendeeCount ?? parsed.attendee_count);
+  return {
+    attendeeCount: Number.isFinite(count) && count > 0 ? Math.round(count) : 1,
+    summary: String(parsed.summary || '').trim() || 'Meeting processed successfully.',
+    actionItems: Array.isArray(parsed.actionItems)
+      ? parsed.actionItems.map(item => String(item).trim()).filter(Boolean)
+      : [],
+    followUp: String(parsed.followUp || parsed.follow_up || '').trim(),
+    raw,
+  };
+}
+
+/**
+ * Persists a follow-up into the dedicated public.follow_ups table.
+ * source: 'voice' | 'audio' | 'text' | 'document'
+ * Never throws — logging a follow-up must not fail the request.
+ */
+async function saveFollowUp({ userId, source, result, transcript, title = 'Meeting Follow-up' }) {
+  if (!userId) return { saved: false };
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('follow_ups')
+      .insert({
+        user_id: userId,
+        source,
+        title,
+        summary: result.summary || null,
+        action_items: Array.isArray(result.actionItems) ? result.actionItems : [],
+        follow_up_text: result.followUp || null,
+        attendee_count: result.attendeeCount || null,
+        transcript: transcript || null,
+        status: 'open',
+      })
+      .select('id')
+      .single();
+
+    if (error) throw error;
+    return { saved: true, id: data?.id || null };
+  } catch (err) {
+    console.error('❌ [FollowUp] save failed:', err.message);
+    return { saved: false, error: err.message };
+  }
+}
+
 async function summarizeMeetingTranscriptWithGemini(transcript) {
   const prompt = `You are a meeting recap assistant.
 
@@ -1008,12 +1069,7 @@ Turn this meeting transcript/recap into a clean, structured meeting note:
 
 """${transcript}"""
 
-Return ONLY valid JSON in exactly this shape:
-{
-  "summary": "2-4 sentence plain-English meeting summary",
-  "actionItems": ["one action item per string; include owner if mentioned"],
-  "followUp": "short ready-to-send follow-up message for attendees"
-}`;
+${RECAP_JSON_INSTRUCTIONS}`;
 
   const response = await axios.post(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
@@ -1041,14 +1097,7 @@ Return ONLY valid JSON in exactly this shape:
     };
   }
 
-  return {
-    summary: String(parsed.summary || '').trim() || 'Meeting processed successfully.',
-    actionItems: Array.isArray(parsed.actionItems)
-      ? parsed.actionItems.map(item => String(item).trim()).filter(Boolean)
-      : [],
-    followUp: String(parsed.followUp || parsed.follow_up || '').trim(),
-    raw,
-  };
+  return normalizeRecapResult(parsed, raw);
 }
 
 /**
@@ -1066,16 +1115,7 @@ app.post('/api/meetings/summarize-text', validateApiKey, async (req, res) => {
     console.log(`📝 [MeetingText] Summarizing transcript (${transcript.length} chars)...`);
     const result = await summarizeMeetingTranscriptWithGemini(transcript);
 
-    if (userId) {
-      await supabase.from('voice_logs').insert({
-        user_id: userId,
-        transcript,
-        action: 'meeting_text_summary',
-        title: 'Meeting Voice Summary',
-        notes: formatFollowUpLogNotes(result),
-        status: 'done',
-      });
-    }
+    await saveFollowUp({ userId, source: 'text', result, transcript });
 
     console.log(`✅ [MeetingText] Summary complete — ${result.actionItems.length} action items`);
     res.json(result);
@@ -1095,9 +1135,10 @@ app.post('/api/meetings/summarize-media', validateApiKey, upload.single('media')
     const file = req.file;
     const { userId } = req.body;
 
-    if (!file) return res.status(400).json({ error: 'No meeting media uploaded' });
-    if (!file.mimetype?.startsWith('audio/') && !file.mimetype?.startsWith('video/')) {
-      return res.status(400).json({ error: 'Please upload an audio or video file' });
+    if (!file) return res.status(400).json({ error: 'No meeting audio uploaded' });
+    // Audio only — we do not accept video (e.g. mp4). Recap is built from spoken audio (mp3/m4a/wav).
+    if (!file.mimetype?.startsWith('audio/')) {
+      return res.status(400).json({ error: 'Please upload an audio file (mp3, m4a, or wav).' });
     }
     if (!process.env.GEMINI_API_KEY) {
       return res.status(500).json({ error: 'Gemini API key is not configured' });
@@ -1107,15 +1148,21 @@ app.post('/api/meetings/summarize-media', validateApiKey, upload.single('media')
 
     const prompt = `You are a meeting transcription and recap assistant.
 
-Analyze the attached meeting audio/video. First transcribe the spoken meeting content. Then produce a concise recap.
+Analyze the attached meeting audio. First transcribe the spoken meeting content (use speaker labels if confidently detectable, so you can tell how many people spoke). Then produce a concise recap.
 
 Return ONLY valid JSON in exactly this shape:
 {
   "transcript": "plain text transcript of the spoken meeting, speaker labels if confidently detectable",
+  "attendeeCount": <integer — how many people this follow-up will be sent to, i.e. the OTHER participants besides the speaker. Use 1 for a one-on-one, 2 or more for a group. Never use 0.>,
   "summary": "2-4 sentence plain-English meeting summary",
-  "actionItems": ["one action item per string; include owner if mentioned"],
-  "followUp": "short ready-to-send follow-up message for attendees"
+  "actionItems": ["one action item per string; include the owner if mentioned"],
+  "followUp": "a short, ready-to-send follow-up message to the other attendee(s)"
 }
+
+Rules for "followUp":
+- If attendeeCount is 1, write a personal one-to-one message. Greet the single person ("Hi <name>," or "Hi," if unknown) and thank them in the singular — say "Thank you", and NEVER "Thank you everyone".
+- If attendeeCount is 2 or more, address the group ("Hi everyone,") and you may use "Thank you everyone".
+- Keep it concise, warm, and professional.
 
 If speech is unclear, still return valid JSON and explain the limitation in summary.`;
 
@@ -1152,25 +1199,18 @@ If speech is unclear, still return valid JSON and explain the limitation in summ
     }
 
     const result = {
+      ...normalizeRecapResult(parsed, raw),
       transcript: String(parsed.transcript || '').trim(),
-      summary: String(parsed.summary || '').trim() || 'Meeting processed successfully.',
-      actionItems: Array.isArray(parsed.actionItems)
-        ? parsed.actionItems.map(item => String(item).trim()).filter(Boolean)
-        : [],
-      followUp: String(parsed.followUp || parsed.follow_up || '').trim(),
-      raw,
     };
 
-    if (userId) {
-      await supabase.from('voice_logs').insert({
-        user_id: userId,
-        transcript: result.transcript || `Uploaded meeting media: ${file.originalname}`,
-        action: 'meeting_media_summary',
-        title: 'Meeting Media Summary',
-        notes: formatFollowUpLogNotes(result),
-        status: 'done',
-      });
-    }
+    // 'voice' = recorded in-app, 'audio' = uploaded file. Both arrive here.
+    const source = req.body.source === 'voice' ? 'voice' : 'audio';
+    await saveFollowUp({
+      userId,
+      source,
+      result,
+      transcript: result.transcript || `Uploaded meeting audio: ${file.originalname}`,
+    });
 
     console.log(`✅ [MeetingMedia] Summary complete — ${result.actionItems.length} action items`);
     res.json(result);
@@ -1178,6 +1218,78 @@ If speech is unclear, still return valid JSON and explain the limitation in summ
     const errMsg = error.response?.data?.error?.message || error.message;
     console.error('❌ [MeetingMedia] Error:', errMsg);
     res.status(500).json({ error: `Meeting media summary failed: ${errMsg}` });
+  }
+});
+
+/**
+ * 📄 Meeting Document Follow-up (PDF / Docs / minutes of meeting)
+ * Receives: multipart/form-data with 'document' file and optional 'userId'
+ * Produces the same follow-up recap shape as the text/audio paths.
+ */
+app.post('/api/meetings/summarize-document', validateApiKey, upload.single('document'), async (req, res) => {
+  try {
+    const file = req.file;
+    const { userId } = req.body;
+
+    if (!file) return res.status(400).json({ error: 'No document uploaded' });
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'Gemini API key is not configured' });
+    }
+
+    console.log(`📄 [MeetingDoc] Summarizing ${file.originalname} (${file.mimetype}, ${file.size} bytes)...`);
+
+    const prompt = `You are a meeting recap assistant.
+
+The attached document is a meeting note, minutes of meeting, agenda, or recap. Read it carefully and produce a clean follow-up.
+
+${RECAP_JSON_INSTRUCTIONS}`;
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType: file.mimetype, data: file.buffer.toString('base64') } }
+          ]
+        }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 1500,
+          responseMimeType: 'application/json',
+        },
+      },
+      { timeout: 120000 }
+    );
+
+    const raw = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    let parsed;
+    try {
+      parsed = parseJsonObject(raw);
+    } catch (parseError) {
+      console.warn('⚠️ [MeetingDoc] JSON parse failed:', parseError.message);
+      parsed = {
+        summary: raw.substring(0, 1200) || 'Could not parse the document.',
+        actionItems: [],
+        followUp: '',
+      };
+    }
+
+    const result = normalizeRecapResult(parsed, raw);
+
+    await saveFollowUp({
+      userId,
+      source: 'document',
+      result,
+      transcript: `Uploaded meeting document: ${file.originalname}`,
+    });
+
+    console.log(`✅ [MeetingDoc] Summary complete — ${result.actionItems.length} action items`);
+    res.json(result);
+  } catch (error) {
+    const errMsg = error.response?.data?.error?.message || error.message;
+    console.error('❌ [MeetingDoc] Error:', errMsg);
+    res.status(500).json({ error: `Meeting document summary failed: ${errMsg}` });
   }
 });
 
