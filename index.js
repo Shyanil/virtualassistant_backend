@@ -1038,6 +1038,12 @@ function normalizeRecapResult(parsed, raw) {
 async function saveFollowUp({ userId, source, result, transcript, title = 'Meeting Follow-up' }) {
   if (!userId) return { saved: false };
   try {
+    const actionItems = Array.isArray(result.actionItems) ? result.actionItems : [];
+    // `tasks` is the checklist the to-do screen renders: one { text, done } per
+    // action item, individually checkable. `action_items` is kept as the plain
+    // string list for the share message and backward compatibility.
+    const tasks = actionItems.map((item) => ({ text: String(item), done: false }));
+
     const { data, error } = await supabaseAdmin
       .from('follow_ups')
       .insert({
@@ -1045,7 +1051,8 @@ async function saveFollowUp({ userId, source, result, transcript, title = 'Meeti
         source,
         title,
         summary: result.summary || null,
-        action_items: Array.isArray(result.actionItems) ? result.actionItems : [],
+        action_items: actionItems,
+        tasks,
         follow_up_text: result.followUp || null,
         attendee_count: result.attendeeCount || null,
         transcript: transcript || null,
@@ -1115,10 +1122,10 @@ app.post('/api/meetings/summarize-text', validateApiKey, async (req, res) => {
     console.log(`📝 [MeetingText] Summarizing transcript (${transcript.length} chars)...`);
     const result = await summarizeMeetingTranscriptWithGemini(transcript);
 
-    await saveFollowUp({ userId, source: 'text', result, transcript });
+    const saved = await saveFollowUp({ userId, source: 'text', result, transcript });
 
     console.log(`✅ [MeetingText] Summary complete — ${result.actionItems.length} action items`);
-    res.json(result);
+    res.json({ ...result, followUpId: saved?.id || null });
   } catch (error) {
     const errMsg = error.response?.data?.error?.message || error.message;
     console.error('❌ [MeetingText] Error:', errMsg);
@@ -1205,7 +1212,7 @@ If speech is unclear, still return valid JSON and explain the limitation in summ
 
     // 'voice' = recorded in-app, 'audio' = uploaded file. Both arrive here.
     const source = req.body.source === 'voice' ? 'voice' : 'audio';
-    await saveFollowUp({
+    const saved = await saveFollowUp({
       userId,
       source,
       result,
@@ -1213,7 +1220,7 @@ If speech is unclear, still return valid JSON and explain the limitation in summ
     });
 
     console.log(`✅ [MeetingMedia] Summary complete — ${result.actionItems.length} action items`);
-    res.json(result);
+    res.json({ ...result, followUpId: saved?.id || null });
   } catch (error) {
     const errMsg = error.response?.data?.error?.message || error.message;
     console.error('❌ [MeetingMedia] Error:', errMsg);
@@ -1277,7 +1284,7 @@ ${RECAP_JSON_INSTRUCTIONS}`;
 
     const result = normalizeRecapResult(parsed, raw);
 
-    await saveFollowUp({
+    const saved = await saveFollowUp({
       userId,
       source: 'document',
       result,
@@ -1285,7 +1292,7 @@ ${RECAP_JSON_INSTRUCTIONS}`;
     });
 
     console.log(`✅ [MeetingDoc] Summary complete — ${result.actionItems.length} action items`);
-    res.json(result);
+    res.json({ ...result, followUpId: saved?.id || null });
   } catch (error) {
     const errMsg = error.response?.data?.error?.message || error.message;
     console.error('❌ [MeetingDoc] Error:', errMsg);
