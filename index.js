@@ -6,6 +6,8 @@ const morgan = require('morgan');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const { google } = require('googleapis');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,8 +20,13 @@ app.use(morgan('dev'));
 // ─── API Key Auth Middleware ─────────────────────────────────
 const validateApiKey = (req, res, next) => {
   const configuredKey = process.env.BACKEND_API_KEY;
-  // Only enforce if the key is configured (skip check in dev when key not set)
-  if (!configuredKey) return next();
+  // Fail closed: if the key isn't configured, reject rather than letting every
+  // request through. (The API key is a coarse gate — real per-user auth is
+  // handled by verifyFirebaseToken on the AI endpoints.)
+  if (!configuredKey) {
+    console.error('❌ [Config] BACKEND_API_KEY is not set — rejecting request (fail closed).');
+    return res.status(500).json({ error: 'Server misconfigured: API key not set.' });
+  }
   const apiKey = req.headers['x-api-key'];
   if (!apiKey || apiKey !== configuredKey) {
     return res.status(401).json({ error: 'Unauthorized: Invalid or missing API key.' });
@@ -41,6 +48,89 @@ if (!supabaseServiceKey) {
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
   supabaseServiceKey || process.env.SUPABASE_ANON_KEY
+);
+
+// ─── Auth & abuse protection for the AI endpoints (#4) ───────────────
+// Render runs behind a proxy; trust the first hop so rate limiting reads the
+// real client IP rather than the proxy's.
+app.set('trust proxy', 1);
+
+// Keyless Firebase ID-token verification: verify the token's signature against
+// Google's PUBLIC certificates and check issuer/audience against the project ID.
+// No service account key/secret is needed — only the public FIREBASE_PROJECT_ID.
+// If it isn't set, token checks are skipped (logged) so existing deploys keep
+// working until you add it — at which point enforcement turns on automatically.
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID || null;
+const FIREBASE_TOKEN_ISSUER = FIREBASE_PROJECT_ID ? `https://securetoken.google.com/${FIREBASE_PROJECT_ID}` : null;
+const FIREBASE_CERTS_URL = 'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
+
+if (FIREBASE_PROJECT_ID) {
+  console.log(`✅ [Auth] Keyless Firebase token verification is ON for project "${FIREBASE_PROJECT_ID}".`);
+} else {
+  console.warn('⚠️ [Auth] FIREBASE_PROJECT_ID not set — Firebase token verification is DISABLED. Set it to enforce per-user auth.');
+}
+
+// Google's token-signing certs rotate; cache them and honour the Cache-Control max-age.
+let googleCerts = null;
+let googleCertsExpiry = 0;
+async function getGoogleSigningCerts() {
+  if (googleCerts && Date.now() < googleCertsExpiry) return googleCerts;
+  const res = await axios.get(FIREBASE_CERTS_URL);
+  googleCerts = res.data; // { "<kid>": "-----BEGIN CERTIFICATE-----..." }
+  const maxAge = Number((res.headers['cache-control'] || '').match(/max-age=(\d+)/)?.[1]) || 3600;
+  googleCertsExpiry = Date.now() + maxAge * 1000;
+  return googleCerts;
+}
+
+// Verifies `Authorization: Bearer <Firebase ID token>` and attaches req.firebaseUser
+// ({ uid, ... }, where uid === users.firebase_uid). Enforce-if-configured: when
+// FIREBASE_PROJECT_ID isn't set, requests pass through so deploying never bricks
+// the app.
+async function verifyFirebaseToken(req, res, next) {
+  if (!FIREBASE_PROJECT_ID) return next();
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized: missing session token. Please sign in again.' });
+  }
+  try {
+    const decoded = jwt.decode(token, { complete: true });
+    const kid = decoded?.header?.kid;
+    if (!kid) throw new Error('token has no key id');
+    const certs = await getGoogleSigningCerts();
+    const cert = certs[kid];
+    if (!cert) throw new Error('no matching Google signing certificate');
+    const payload = jwt.verify(token, cert, {
+      algorithms: ['RS256'],
+      audience: FIREBASE_PROJECT_ID,
+      issuer: FIREBASE_TOKEN_ISSUER,
+    });
+    if (!payload.sub) throw new Error('token has no subject');
+    req.firebaseUser = { ...payload, uid: payload.user_id || payload.sub };
+    next();
+  } catch (err) {
+    console.warn('⚠️ [Auth] Token verification failed:', err.message);
+    return res.status(401).json({ error: 'Unauthorized: invalid or expired session. Please sign in again.' });
+  }
+}
+
+// Per-user (fallback per-IP) rate limit for the cost-heavy AI endpoints, so an
+// extracted API key + a loop can't run up the Google STT / Gemini bill.
+const aiRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,                 // generous: ~6–7 sustained requests/min per user
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.firebaseUser?.uid || ipKeyGenerator(req.ip),
+  message: { error: 'Too many requests. Please wait a few minutes and try again.' },
+});
+
+// Gate the expensive AI endpoints behind token auth + rate limiting. Registered
+// before the route handlers so it runs first for these paths.
+app.use(
+  ['/api/transcribe', '/api/analyze', '/api/analyze-document', '/api/chat', '/api/meetings'],
+  verifyFirebaseToken,
+  aiRateLimiter,
 );
 
 const WHATSAPP_REMINDER_LEAD_MINUTES = 20;
@@ -1364,21 +1454,21 @@ If speech is unclear, still return valid JSON and explain the limitation in summ
  * Receives: multipart/form-data with 'document' file and optional 'userId'
  * Produces the same follow-up recap shape as the text/audio paths.
  */
-app.post('/api/meetings/summarize-document', validateApiKey, upload.single('document'), async (req, res) => {
+app.post('/api/meetings/summarize-document', validateApiKey, upload.array('document', 10), async (req, res) => {
   try {
-    const file = req.file;
+    const files = req.files || [];
     const { userId } = req.body;
 
-    if (!file) return res.status(400).json({ error: 'No document uploaded' });
+    if (files.length === 0) return res.status(400).json({ error: 'No document uploaded' });
     if (!process.env.GEMINI_API_KEY) {
       return res.status(500).json({ error: 'Gemini API key is not configured' });
     }
 
-    console.log(`📄 [MeetingDoc] Summarizing ${file.originalname} (${file.mimetype}, ${file.size} bytes)...`);
+    console.log(`📄 [MeetingDoc] Summarizing ${files.length} document(s): ${files.map((f) => f.originalname).join(', ')} ...`);
 
     const prompt = `You are a meeting recap assistant.
 
-The attached document is a meeting note, minutes of meeting, agenda, or recap. Read it carefully and produce a clean follow-up.
+The attached document(s) are meeting notes, minutes of meeting, agendas, or recaps. Read them all carefully and produce a single clean follow-up that covers everything across them.
 
 ${RECAP_JSON_INSTRUCTIONS}`;
 
@@ -1388,7 +1478,9 @@ ${RECAP_JSON_INSTRUCTIONS}`;
         contents: [{
           parts: [
             { text: prompt },
-            { inlineData: { mimeType: file.mimetype, data: file.buffer.toString('base64') } }
+            ...files.map((file) => ({
+              inlineData: { mimeType: file.mimetype, data: file.buffer.toString('base64') },
+            }))
           ]
         }],
         generationConfig: {
@@ -1419,7 +1511,7 @@ ${RECAP_JSON_INSTRUCTIONS}`;
       userId,
       source: 'document',
       result,
-      transcript: `Uploaded meeting document: ${file.originalname}`,
+      transcript: `Uploaded meeting document(s): ${files.map((f) => f.originalname).join(', ')}`,
     });
 
     console.log(`✅ [MeetingDoc] Summary complete — ${result.actionItems.length} action items`);
@@ -1518,20 +1610,18 @@ app.post('/api/follow-ups/:id/whatsapp-reminder', validateApiKey, async (req, re
  * 📄 Analyze Document (Gemini 2.5 Pro Vision)
  * Receives: multipart/form-data with 'document' file and 'userId'
  */
-app.post('/api/analyze-document', validateApiKey, upload.single('document'), async (req, res) => {
+app.post('/api/analyze-document', validateApiKey, upload.array('document', 10), async (req, res) => {
   try {
-    const file = req.file;
+    const files = req.files || [];
     const { userId } = req.body;
 
-    if (!file) return res.status(400).json({ error: 'No document uploaded' });
+    if (files.length === 0) return res.status(400).json({ error: 'No document uploaded' });
 
-    console.log(`📄 [Document] Analyzing ${file.originalname} (${file.mimetype}) ...`);
-    const mimeType = file.mimetype;
-    const base64Data = file.buffer.toString('base64');
+    console.log(`📄 [Document] Analyzing ${files.length} document(s): ${files.map((f) => f.originalname).join(', ')} ...`);
 
-    const prompt = `Analyze this document carefully.
+    const prompt = `Analyze the attached document(s) carefully.
 
-First, extract any important dates, deadlines, meetings, events, or appointments mentioned.
+First, extract any important dates, deadlines, meetings, events, or appointments mentioned across all of them.
 
 Then return your response as VALID JSON in exactly this format (no markdown, no extra text):
 {
@@ -1551,11 +1641,13 @@ If no specific dates are found, return an empty events array. Only return valid 
     const response = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
-        contents: [{ 
+        contents: [{
           parts: [
             { text: prompt },
-            { inlineData: { mimeType: mimeType, data: base64Data } }
-          ] 
+            ...files.map((file) => ({
+              inlineData: { mimeType: file.mimetype, data: file.buffer.toString('base64') },
+            }))
+          ]
         }],
         generationConfig: { temperature: 0.1 },
       }
@@ -1583,7 +1675,7 @@ If no specific dates are found, return an empty events array. Only return valid 
       console.log('💾 [DB] Saving Document Log to Supabase for user:', userId);
       await supabase.from('voice_logs').insert({
         user_id: userId,
-        transcript: 'Uploaded Document: ' + file.originalname,
+        transcript: 'Uploaded Documents: ' + files.map((f) => f.originalname).join(', '),
         action: 'document_analysis',
         title: 'Document Analysis',
         notes: parsed.summary,
