@@ -45,8 +45,6 @@ const supabaseAdmin = createClient(
 
 const WHATSAPP_REMINDER_LEAD_MINUTES = 20;
 const CALL_REMINDER_LEAD_MINUTES = 5;
-const DEFAULT_TEST_USER_PHONE = process.env.DEFAULT_TEST_USER_PHONE || '918282831626';
-const DEFAULT_TEST_ATTENDEE_PHONE = process.env.DEFAULT_TEST_ATTENDEE_PHONE || '919830753118';
 
 function isSharedSecretValid(incomingSecret) {
   const expectedSecret = process.env.N8N_SHARED_SECRET;
@@ -257,6 +255,23 @@ function parseJsonObject(rawText) {
   const jsonMatch = rawText.match(/\{[\s\S]*\}/);
   const cleaned = jsonMatch ? jsonMatch[0] : rawText;
   return JSON.parse(cleaned);
+}
+
+// Returns the calendar date (YYYY-MM-DD) for `date` as seen in `timeZone`.
+// Falls back to the UTC date if the timezone is missing/invalid.
+function formatDateInTimeZone(date, timeZone) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timeZone || 'UTC',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}`;
+  } catch {
+    return date.toISOString().split('T')[0];
+  }
 }
 
 function formatFollowUpLogNotes(result) {
@@ -770,8 +785,23 @@ app.post('/api/analyze', validateApiKey, async (req, res) => {
     const model = selectModel(transcript);
     console.log(`🧠 [AI] Analyzing intent using ${model} for:`, transcript);
     
-    const today = new Date().toISOString().split('T')[0];
-    const prompt = `Today is ${today}. User timezone is ${timeZone || 'UTC'}.
+    // Resolve "today" in the USER's timezone, not the server's UTC clock, so
+    // relative dates ("tomorrow", "tonight", "in 2 hours") land on the right day.
+    const requestedTimeZone = timeZone || 'UTC';
+    const now = new Date();
+    const today = formatDateInTimeZone(now, requestedTimeZone);
+    let localNowLabel = today;
+    try {
+      localNowLabel = new Intl.DateTimeFormat('en-US', {
+        timeZone: requestedTimeZone,
+        weekday: 'long',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      }).format(now);
+    } catch { /* keep the date-only label */ }
+
+    const prompt = `Today is ${today} (${localNowLabel}). User timezone is ${requestedTimeZone}.
 User said: "${transcript}".
 Convert this into a clean calendar-ready structure.
 Return ONLY valid JSON:
@@ -828,7 +858,10 @@ Return ONLY valid JSON:
       }
     }
 
-    const userPhone = cleanPhoneNumber(req.body.user_phone || req.body.userPhone || userProfile?.phone || DEFAULT_TEST_USER_PHONE);
+    // Always use the real user phone (from the request or their profile) — never
+    // a hardcoded test number. A null phone is safe: the meeting still saves and
+    // shows (via voice_logs); it just won't trigger a WhatsApp reminder.
+    const userPhone = cleanPhoneNumber(req.body.user_phone || req.body.userPhone || userProfile?.phone || null);
     const attendeePhone = cleanPhoneNumber(req.body.attendee_phone || req.body.attendeePhone || null);
 
     try {
