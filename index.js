@@ -920,6 +920,18 @@ app.post('/api/chat', validateApiKey, async (req, res) => {
     const today = formatDateInZone(now);
     const end = formatDateInZone(rangeEnd);
 
+    // Personalize the assistant with the user's real first name for the prompt.
+    let userName = 'the user';
+    if (userId) {
+      const { data: profile } = await supabaseAdmin
+        .from('users')
+        .select('name, full_name')
+        .eq('firebase_uid', userId)
+        .maybeSingle();
+      const fullName = (profile?.name || profile?.full_name || '').trim();
+      if (fullName) userName = fullName.split(/\s+/)[0];
+    }
+
     let contextEvents = [];
     if (userId) {
       const { data, error } = await supabase
@@ -940,6 +952,25 @@ app.post('/api/chat', validateApiKey, async (req, res) => {
       }
     }
 
+    // Pending follow-ups / tasks — the user also treats these as "meetings",
+    // so the assistant must be able to answer about them.
+    let followUps = [];
+    if (userId) {
+      const { data, error } = await supabaseAdmin
+        .from('follow_ups')
+        .select('title, summary, action_items, tasks, follow_up_text, reminder_status, reminder_at, created_at')
+        .eq('user_id', userId)
+        .eq('status', 'open')
+        .order('created_at', { ascending: false })
+        .limit(10);
+
+      if (error) {
+        console.warn('⚠️ [Chat] Follow-up query failed:', error.message);
+      } else {
+        followUps = data || [];
+      }
+    }
+
     const scheduleText = contextEvents.length
       ? contextEvents.map((event, index) => {
           const when = [event.date, event.time].filter(Boolean).join(' ');
@@ -947,37 +978,99 @@ app.post('/api/chat', validateApiKey, async (req, res) => {
         }).join('\n')
       : 'No upcoming events found in the next 7 days.';
 
+    const followUpsText = followUps.length
+      ? followUps.map((fu, index) => {
+          const tasks = Array.isArray(fu.tasks) ? fu.tasks : [];
+          const pending = tasks.filter(t => t && !t.done).map(t => t.text);
+          const items = pending.length
+            ? pending.join('; ')
+            : (Array.isArray(fu.action_items) && fu.action_items.length
+                ? fu.action_items.join('; ')
+                : 'No open tasks');
+          const reminder = fu.reminder_status === 'scheduled' && fu.reminder_at
+            ? ` [reminder set for ${fu.reminder_at}]`
+            : '';
+          return `${index + 1}. ${fu.title || 'Meeting Follow-up'}${reminder} — ${items}`;
+        }).join('\n')
+      : 'No pending follow-ups.';
+
     const recentHistory = Array.isArray(history)
       ? history.slice(-8).map(item => `${item.role === 'assistant' ? 'Assistant' : 'User'}: ${item.content}`).join('\n')
       : '';
 
-    const prompt = `You are Adamslave, the user's high-end personal calendar assistant.
-Today is ${today}. User timezone: ${requestedTimeZone}.
+    const prompt = `You are a personal meeting assistant for ${userName}.
 
-USER SCHEDULE FOR THE NEXT 7 DAYS:
+You ONLY have access to ${userName}'s calendar data that has been provided to you in this conversation. You must ONLY answer questions based on that data — do not assume, invent, or guess any meeting, event, or free time that is not explicitly present in the provided context.
+
+You help ${userName} with:
+- Upcoming meetings and events
+- Free time slots in their schedule
+- Pending follow-ups and tasks
+- Meeting details like time, date, person, location, or notes
+
+If ${userName} asks anything outside of their calendar and meeting data (general knowledge, unrelated questions, jokes, anything else), respond with exactly:
+"I can only help you with your meetings, calendar, and follow-ups. Please ask me something related to your schedule."
+
+If ${userName} asks to schedule, delete, or modify a meeting, respond with exactly:
+"To schedule or manage meetings, please use the Home tab — you can add via voice, note, or document upload."
+
+Never answer from general knowledge. Never go outside the data provided to you. You are strictly a calendar and meeting assistant for ${userName} only.
+
+────────────────────────────
+Today is ${today}. ${userName}'s timezone: ${requestedTimeZone}.
+
+UPCOMING MEETINGS & EVENTS (next 7 days):
 ${scheduleText}
+
+PENDING FOLLOW-UPS & TASKS:
+${followUpsText}
 
 CONVERSATION HISTORY:
 ${recentHistory || 'First interaction.'}
 
-USER REQUEST: "${message}"
+CURRENT QUESTION FROM ${userName}: "${message}"`;
 
-INSTRUCTIONS:
-1. Be professional, concierge-like, and helpful.
-2. Focus ONLY on the user's calendar and schedule.
-3. If they ask about "upcoming" things, summarize the next few events from the schedule provided above.
-4. If they ask about something not in their calendar (like general knowledge or images), politely pivot back to how you can help with their schedule.
-5. Keep responses concise but "top-notch" in quality.`;
+    // Model call with fallback: try the fast/cheap model first, escalate to the
+    // stronger model only if the answer comes back empty or low-confidence.
+    const PRIMARY_MODEL = 'gemini-2.5-flash';
+    const FALLBACK_MODEL = 'gemini-2.5-pro';
 
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 800 },
+    const callGemini = async (model, p) => {
+      try {
+        const resp = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+          {
+            contents: [{ parts: [{ text: p }] }],
+            generationConfig: { temperature: 0.2, maxOutputTokens: 800 },
+          },
+          { timeout: 60000 }
+        );
+        const text = resp.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+        return { text };
+      } catch (err) {
+        console.warn(`⚠️ [Chat] ${model} call failed:`, err.response?.data?.error?.message || err.message);
+        return { text: '' };
       }
-    );
+    };
 
-    const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 'I could not generate a response.';
+    let result = await callGemini(PRIMARY_MODEL, prompt);
+
+    const isWeak = !result.text ||
+                   result.text.length < 80 ||
+                   result.text.toLowerCase().includes("i'm not sure") ||
+                   result.text.toLowerCase().includes("i don't know") ||
+                   result.text.toLowerCase().includes("i cannot");
+
+    if (isWeak) {
+      const fallback = await callGemini(FALLBACK_MODEL, prompt);
+      if (fallback.text) result = fallback;
+    }
+
+    // Hardcoded safety net: if both models return nothing, never leave the user
+    // with a blank reply — serve a helpful, on-brand message instead of relying
+    // on the AI to always respond.
+    const HARDCODED_EMPTY_REPLY = `I couldn't pull that together just now. Try asking me something like "What's on my calendar today?", "When am I free this week?", or "What follow-ups do I have?"`;
+    const reply = result.text || HARDCODED_EMPTY_REPLY;
 
     res.json({
       reply,
@@ -990,7 +1083,12 @@ INSTRUCTIONS:
     });
   } catch (error) {
     console.error('❌ [Chat] Error:', error.response?.data?.error?.message || error.message);
-    res.status(500).json({ error: 'Chat failed' });
+    // Graceful hardcoded fallback so the chat box always shows something useful
+    // instead of a raw error.
+    res.json({
+      reply: `I'm having trouble reaching your assistant right now. Your schedule is safe — please try again in a moment.`,
+      contextEvents: [],
+    });
   }
 });
 
@@ -1297,6 +1395,89 @@ ${RECAP_JSON_INSTRUCTIONS}`;
     const errMsg = error.response?.data?.error?.message || error.message;
     console.error('❌ [MeetingDoc] Error:', errMsg);
     res.status(500).json({ error: `Meeting document summary failed: ${errMsg}` });
+  }
+});
+
+/**
+ * ⏰ Schedule a WhatsApp follow-up reminder to the user (themselves only).
+ * Receives: { userId, date (YYYY-MM-DD), time (HH:MM 24h), timezone, body }
+ * Saves the reminder on the follow_up row. If the n8n pipeline is wired it
+ * also hands off a scheduled job; the actual WhatsApp send (MSG91 template) is
+ * a later integration, so a missing/failing webhook never fails the request.
+ */
+app.post('/api/follow-ups/:id/whatsapp-reminder', validateApiKey, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId, date, time, timezone, body } = req.body;
+
+    if (!id || !userId) return res.status(400).json({ scheduled: false, reason: 'missing_fields', error: 'Missing follow-up id or userId' });
+    if (!date || !time) return res.status(400).json({ scheduled: false, reason: 'missing_fields', error: 'Missing reminder date or time' });
+
+    const messageBody = String(body || '').trim();
+    if (!messageBody) return res.status(400).json({ scheduled: false, reason: 'missing_fields', error: 'Reminder message body is required' });
+
+    const tz = timezone || 'Asia/Kolkata';
+    let remindAt;
+    try {
+      remindAt = localDateTimeToUtc(date, time, tz);
+    } catch {
+      return res.status(400).json({ scheduled: false, reason: 'invalid_datetime', error: 'Invalid reminder date/time' });
+    }
+    if (remindAt <= new Date()) {
+      return res.status(400).json({ scheduled: false, reason: 'past_time', error: 'Reminder time must be in the future' });
+    }
+
+    // The reminder goes to the user's own WhatsApp number.
+    const { data: profile } = await supabaseAdmin
+      .from('users')
+      .select('phone, name')
+      .eq('firebase_uid', userId)
+      .maybeSingle();
+    const userPhone = cleanPhoneNumber(profile?.phone);
+    if (!userPhone) return res.status(400).json({ scheduled: false, reason: 'no_phone', error: 'No phone number on your profile' });
+
+    // Persist the reminder on the follow-up row.
+    const { error: updateError } = await supabaseAdmin
+      .from('follow_ups')
+      .update({
+        reminder_status: 'scheduled',
+        reminder_at: remindAt.toISOString(),
+        reminder_body: messageBody,
+        reminder_to: userPhone,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .eq('user_id', userId);
+    if (updateError) throw updateError;
+
+    // Hand the scheduled job to n8n only if the pipeline is wired. The WhatsApp
+    // send (MSG91 template) is a later integration, so a missing/failing
+    // webhook must NOT fail the user's action — the reminder is already saved.
+    if (process.env.N8N_WHATSAPP_WEBHOOK_URL) {
+      try {
+        await sendWhatsAppReminderJobToN8n({
+          type: 'follow_up_reminder',
+          follow_up_id: id,
+          user_id: userId,
+          user_name: profile?.name || 'there',
+          body: messageBody,
+          to: userPhone,
+          user_phone: userPhone,
+          recipient_phones: [userPhone],
+          timezone: tz,
+          whatsapp_reminder_at: remindAt.toISOString(),
+          template_name: process.env.MSG91_FOLLOWUP_TEMPLATE_NAME || 'followup_reminder',
+        });
+      } catch (n8nErr) {
+        console.warn('⚠️ [FollowUpReminder] n8n push failed (reminder still saved):', n8nErr.response?.data || n8nErr.message);
+      }
+    }
+
+    console.log(`✅ [FollowUpReminder] Scheduled for ${userPhone} at ${remindAt.toISOString()}`);
+    res.json({ scheduled: true, reminder_at: remindAt.toISOString(), to: userPhone });
+  } catch (error) {
+    console.error('❌ [FollowUpReminder] Error:', error.message);
+    res.status(500).json({ scheduled: false, reason: 'server_error', error: 'Failed to schedule follow-up reminder' });
   }
 });
 
